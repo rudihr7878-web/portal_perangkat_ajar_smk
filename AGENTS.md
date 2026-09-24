@@ -20,13 +20,15 @@ AI-generated reminder/broadcast WhatsApp messages per teacher (with progress + k
 - **Gemini reminder endpoint**: `POST /api/gemini/generate-reminder` di server.ts — input `{topic, teachers[]}` → output array `{teacherIndex, message}` via responseSchema, variasi per guru berdasarkan progress + kekurangan
 - **Frontend AI reminder & broadcast**: state & handler baru (`getKekurangan`, `generateAiReminders`, `handleSendUniqueWA`, `startEdit`/`saveEdit`/`cancelEdit`); topic input → generate AI → preview per teacher (editable inline) → kirim unique per guru via Fonnte
 - **Cron Job Scheduler**: `node-cron` di server.ts — class `CronScheduler` (schedule/unschedule/execute via Gemini+Fonnte); 5 endpoint CRUD (`/api/cron/create`, `/api/cron/list`, `/api/cron/:id/toggle`, `/api/cron/:id/sync`, `DELETE /api/cron/:id`); persist ke `cron_jobs.json`; sub-tab "Cron Job" di MonitoringPanel (form create dengan day picker + time + teacher select; daftar job + toggle + delete + sync progress)
-- **Build**: frontend (vite) + server (esbuild) sukses
+- **Build**: frontend (vite) + server (esbuild) sukses; `npm run lint` hijau
+- **Sinkronisasi lintas perangkat (Supabase + Render)**: install `@supabase/supabase-js`; `db.ts` baru (dbGet/dbPut/dbList/isUsingSupabase, env `SUPABASE_URL`+`SUPABASE_SERVICE_ROLE_KEY`, fallback folder `data/`); `server.ts` CORS (env `CORS_ORIGIN`), endpoint `GET /api/health`, `GET /api/data/list?prefix=`, `GET/PUT /api/data/:key`, `POST /api/data/:key/delete`; loadCronJobs/saveCronJobs async (key `cron_jobs` di DB, fallback `cron_jobs.json`); `PORT` baca env `PORT` (default 3000); `src/api.ts` baru (API_BASE dari `VITE_API_BASE_URL`, apiFetch, cloudGet/cloudPut/cloudList, CLOUD_KEYS); mirror save ke cloud di `saveAdminMasterConfig`/`saveTeacherPortfolio` (utils), `setItem` RPE + `pullRPEFromCloud` (RPEPanel mount), MonitoringPanel baca portfolio via `cloudList`; semua `fetch("/api...` → `apiFetch("/api...`; App.tsx hydrasi adminConfig & portfolio dari cloud saat mount; fix 13 error tipe lama (server cron type, exportHtml fallback types, ModulAjarView score unknown, ProyekCard key props)
+- **GitHub**: repo `rudihr7878-web/portal_perangkat_ajar_smk` branch `master`, commit `0065902`; push pakai format `https://x-access-token:<PAT>@github.com/...` (fine-grained PAT); remote config disimpan tanpa token
 
 ### In Progress
 - (none)
 
 ### Blocked
-- (none)
+- Menunggu user membuat project Supabase → butuh `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` untuk mengaktifkan sinkronisasi cloud
 
 ## Key Decisions
 - **WA gateway**: Fonnte (API token, pay-per-message, REST), bukan whatsapp-web.js
@@ -40,16 +42,22 @@ AI-generated reminder/broadcast WhatsApp messages per teacher (with progress + k
 
 ## Critical Context
 - localStorage keys: `sim_guru_admin_master` (config admin+guru+siswa), `sim_guru_portfolio_{teacherId}` (data per guru)
+- Cloud keys (Supabase/fallback `data/`): `adminMaster` (config), `portfolio_{teacherId}` (kunci `sim_guru_portfolio_...`), `rpe_list`, `rpe_history_*`, `rpe_template_gasal`/`rpe_template_genap`; tabel `public.kv` (text key, jsonb value, timestamptz updated_at)
 - Fonnte token disimpan di admin config, dikirim dari frontend ke `/api/send-wa`
 - Gemini API key dari env `GEMINI_API_KEY` (server-side)
 - Endpoint `/api/send-wa` hanya support 1 message ke 1 target (per guru) — untuk broadcast unik tiap guru, loop di frontend
-- Cron job tersimpan di `cron_jobs.json` di root project, di-schedule ulang otomatis saat server restart
-- `vite build` + `esbuild server.ts` sudah sukses
+- Cron job tersimpan di DB key `cron_jobs` (fallback `cron_jobs.json`), di-schedule ulang otomatis saat server restart
+- `vite build` + `esbuild server.ts` sudah sukses; `npm run lint` (tsc --noEmit) hijau
+- Deploy: Vercel statis (`dist/`) + env `VITE_API_BASE_URL=https://<render>.onrender.com`; Render jalankan `node dist/server.cjs` + env `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY`/`GEMINI_API_KEY`/`CORS_ORIGIN`; ping `API_URL/api/health` tiap ~13 menit agar instance free tidak sleep
 
 ## Relevant Files
 - `src/components/MonitoringPanel.tsx`: progress, AI reminder, AI broadcast, cron job, laporan
 - `src/components/AdminPanel.tsx`: fix kontras, sub-tab Akun Admin, upload XLSX
 - `src/utils.ts`: `AdminMasterConfig` + new fields + merge logic
 - `src/components/LoginScreen.tsx`: baca kredensial dari config
-- `src/App.tsx`: admin sidebar navigation Database ↔ Monitoring
-- `server.ts`: endpoints Fonnte, Gemini generate-reminder, cron job CRUD + scheduler (`CronScheduler`)
+- `src/App.tsx`: admin sidebar navigation Database ↔ Monitoring; hydrasi adminConfig & portfolio dari cloud
+- `server.ts`: endpoints Fonnte, Gemini generate-reminder, cron job CRUD + scheduler (`CronScheduler`), CORS exact-origin, `/api/data/*`, `/api/health`, port dari `process.env.PORT`
+- `db.ts`: layer Supabase (dbGet/dbPut/dbList/isUsingSupabase) + fallback file folder `data/`
+- `src/api.ts`: frontend cloud layer (API_BASE dari `VITE_API_BASE_URL`, apiFetch, cloudGet/cloudPut/cloudList)
+- `src/components/RPE/RPEUtils.ts` & `RPEPanel.tsx`: mirroor RPE ke cloud + pull saat mount
+- `src/components/RPE/RPEForm.tsx`, `AdministrasiKelasKokurikuler.tsx`, `ModulAjarView.tsx`, `exportHtml.ts`: fix error tipe + call site `apiFetch`

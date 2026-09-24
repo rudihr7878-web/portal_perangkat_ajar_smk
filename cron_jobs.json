@@ -1,0 +1,41 @@
+[
+  {
+    "id": "628c63b0-d9e4-4bf6-8dd8-6081cea112fd",
+    "name": "pengingat mingguan",
+    "topic": "mengingat isi administrasi",
+    "teacherIds": [],
+    "daysOfWeek": [
+      1
+    ],
+    "time": "08:00",
+    "enabled": true,
+    "createdAt": "2026-06-21T13:06:02.256Z",
+    "lastRunAt": null,
+    "lastStatus": null,
+    "lastMessage": null,
+    "fonnteToken": "",
+    "teacherData": [
+      {
+        "nama": "Bagus Wicaksono, S.Pd., M.T.",
+        "mapel": "Informatika (Kurikulum Merdeka)",
+        "telepon": "0812-7000-8890",
+        "progressRata": 91,
+        "kekurangan": "Jurnal Harian (40%), Walikelas & Kokurikuler (75%), Cover/Identitas (100%)"
+      },
+      {
+        "nama": "Siti Rahmawati, S.Pd.",
+        "mapel": "Matematika",
+        "telepon": "0813-8888-9900",
+        "progressRata": 91,
+        "kekurangan": "Jurnal Harian (40%), Walikelas & Kokurikuler (75%), Cover/Identitas (100%)"
+      },
+      {
+        "nama": "MAHFUD SYA'RONI",
+        "mapel": "Bahasa Indonesia",
+        "telepon": "",
+        "progressRata": 89,
+        "kekurangan": "Jurnal Harian (40%), Walikelas & Kokurikuler (75%), Cover/Identitas (90%)"
+      }
+    ]
+  }
+]

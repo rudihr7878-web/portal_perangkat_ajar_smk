@@ -1,0 +1,992 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import express from "express";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
+import os from "os";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+import HTMLtoDOCX from "html-to-docx";
+import cron from "node-cron";
+import multer from "multer";
+import pdfParse from "pdf-parse";
+
+// Pre-calculated TWIP (twentieths of a point) values for page margins
+// 1cm ≈ 567 TWIP, 2.54cm = 1 inch = 1440 TWIP
+const PAGE_MARGINS_TWIP = {
+  top: 1440,    // 2.54cm
+  right: 1440,   // 2.54cm
+  bottom: 1440,  // 2.54cm
+  left: 1800,    // 3.18cm
+  header: 850,   // 1.5cm
+  footer: 850,   // 1.5cm
+  gutter: 0      // 0cm
+};
+
+dotenv.config();
+
+const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// ─── CRON JOB TYPES & PERSISTENCE ───
+interface StoredTeacherData {
+  nama: string; mapel: string; telepon: string;
+  progressRata: number; kekurangan: string;
+}
+interface CronJobRecord {
+  id: string; name: string; topic: string;
+  teacherIds: string[]; // empty = all
+  daysOfWeek: number[]; // 0=Sun .. 6=Sat
+  time: string; // "HH:MM" 24h
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt: string | null;
+  lastStatus: "success" | "error" | null;
+  lastMessage: string | null;
+  fonnteToken: string;
+  teacherData: StoredTeacherData[];
+}
+const CRON_JOBS_FILE = path.join(process.cwd(), "cron_jobs.json");
+function loadCronJobs(): CronJobRecord[] {
+  try { if (fs.existsSync(CRON_JOBS_FILE)) return JSON.parse(fs.readFileSync(CRON_JOBS_FILE, "utf-8")); }
+  catch (e) { console.error("Error loading cron jobs:", e); }
+  return [];
+}
+function saveCronJobs(jobs: CronJobRecord[]) {
+  fs.writeFileSync(CRON_JOBS_FILE, JSON.stringify(jobs, null, 2));
+}
+
+// ─── CRON SCHEDULER ───
+class CronScheduler {
+  private tasks = new Map<string, cron.ScheduledTask>();
+  private jobs: CronJobRecord[] = [];
+
+  init(jobs: CronJobRecord[]) {
+    this.jobs = jobs;
+    this.tasks.forEach(t => t.stop());
+    this.tasks.clear();
+    jobs.forEach(j => this.schedule(j));
+    console.log(`CronScheduler: ${this.tasks.size} jobs scheduled`);
+  }
+
+  schedule(job: CronJobRecord) {
+    if (!job.enabled) return;
+    const [h, m] = job.time.split(":").map(Number);
+    const expr = `${m} ${h} * * ${job.daysOfWeek.join(",")}`;
+    try {
+      const task = cron.schedule(expr, () => this.executeJob(job.id));
+      this.tasks.set(job.id, task);
+    } catch (e) {
+      console.error(`Failed to schedule cron ${job.id}:`, e);
+    }
+  }
+
+  unschedule(jobId: string) {
+    const t = this.tasks.get(jobId);
+    if (t) { t.stop(); this.tasks.delete(jobId); }
+  }
+
+  async executeJob(jobId: string) {
+    const idx = this.jobs.findIndex(j => j.id === jobId);
+    if (idx === -1) return;
+    const job = this.jobs[idx];
+    console.log(`Cron executing: ${job.name} (${job.id})`);
+    job.lastStatus = null;
+    saveCronJobs(this.jobs);
+    try {
+      // Generate AI messages using stored teacher data
+      const teachers = job.teacherData.map(t => ({
+        nama: t.nama, mapel: t.mapel,
+        progressRata: t.progressRata, kekurangan: t.kekurangan
+      }));
+      if (!teachers.length) throw new Error("No teacher data in cron job");
+      let reminders: { teacherIndex: number; message: string }[] = [];
+      try {
+        const resp = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: `Buat pesan WhatsApp reminder untuk ${teachers.length} guru berikut.\nTopik: "${job.topic}".\n\nData guru:\n${teachers.map((t: any, i: number) => `Guru ${i+1}: Nama=${t.nama}, Mapel=${t.mapel}, Progress=${t.progressRata}%, Kekurangan=${t.kekurangan}`).join("\n")}\n\nAturan:\n1. Setiap guru mendapat pesan UNIK (variasi pembuka/penutup/struktur).\n2. Sebut progress rata-rata dan 2-3 bagian terendah.\n3. Bahasa formal hangat Indonesia.`,
+          config: {
+            systemInstruction: "Anda admin sekolah. Jawaban array JSON tanpa markdown.",
+            responseMimeType: "application/json",
+            responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { teacherIndex: { type: Type.INTEGER }, message: { type: Type.STRING } }, required: ["teacherIndex", "message"] } }
+          }
+        });
+        reminders = JSON.parse(resp.text || "[]");
+      } catch (e: any) {
+        throw new Error(`Gemini error: ${e.message}`);
+      }
+      // Send via Fonnte
+      let sent = 0, failed = 0;
+      for (const r of reminders) {
+        const td = job.teacherData[r.teacherIndex];
+        if (!td || !td.telepon) { failed++; continue; }
+        try {
+          const params = new URLSearchParams({ target: td.telepon, message: r.message });
+          const resp = await fetch("https://api.fonnte.com/send", {
+            method: "POST",
+            headers: { "Authorization": job.fonnteToken, "Content-Type": "application/x-www-form-urlencoded" },
+            body: params.toString()
+          });
+          const data = await resp.json();
+          if (data.status === true || data.status === "true") sent++;
+          else failed++;
+        } catch { failed++; }
+      }
+      job.lastRunAt = new Date().toISOString();
+      job.lastStatus = "success";
+      job.lastMessage = `Terkirim: ${sent}, Gagal: ${failed}`;
+      console.log(`Cron ${job.name}: ${job.lastMessage}`);
+    } catch (e: any) {
+      job.lastStatus = "error";
+      job.lastMessage = e.message;
+      console.error(`Cron ${job.name} failed:`, e.message);
+    }
+    this.jobs[idx] = job;
+    saveCronJobs(this.jobs);
+  }
+}
+
+const cronScheduler = new CronScheduler();
+
+// Shared Gemini Client on server with telemetry user-agent header
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: {
+    headers: {
+      "User-Agent": "aistudio-build",
+    },
+  },
+});
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: "10mb" }));
+
+  // API Route: AI Generasi Modul Ajar (Deep Learning)
+  app.post("/api/gemini/generate-modul", async (req, res) => {
+    try {
+      const { prompt, currentModul, mapel } = req.body;
+
+      if (!prompt) {
+        return res.status(400).json({ success: false, error: "Prompt is required" });
+      }
+
+      // Safe check for API Key before calling GenAI to prevent startup crashes
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({
+          success: false,
+          error: "GEMINI_API_KEY environment variable is not configured yet in Secrets tab.",
+        });
+      }
+
+      const systemInstruction = `Anda adalah pengembang kurikulum dan guru profesional Indonesia yang ahli dalam menyusun Modul Ajar Kurikulum Merdeka berbasis pendekatan Deep Learning (3 Pilar: Mindful Engagement, Deep Processing, Transfer of Learning).
+Fokus pada materi pelajaran: ${mapel || "Informatika"}.
+Jawaban Anda HARUS berupa objek JSON valid yang persis mengikuti struktur skema yang diminta. Jangan menyertakan penanda markdown seperti \`\`\`json.`;
+
+      const promptText = `Hasilkan rancangan Modul Ajar lengkap dan realistis berdasarkan topik pembelajaran: "${prompt}".
+Sesuaikan materi pokok agar sarat makna untuk murid Fase E, buat pertanyaan pemantik dan pemahaman bermakna yang mendalam.
+Skenario Kegiatan Pembelajaran Utama HARUS bernuansa luring interaktif, mengedepankan Deep Learning (3 langkah pilar):
+1. Mindful Engagement (Fokus Atensi & Curiosity) - isi dengan 3 aksi luring konkret (misal: demonstrasi kejutan, review game).
+2. Deep Processing (Berpikir Kritis & Dialog Konseptual) - isi dengan 3 aktivitas luring konkret (misal: dialog sokratik kelompok, pemetaan skema logika, curah argumen).
+3. Transfer of Learning (Penyelesaian Masalah Nyata & Peer Feedback) - isi dengan 3 aksi luring nyata (misal: simulasi lapangan, peer code review, stress test rancangan).
+
+Gunakan bahasa formal akademik Indonesia yang elegan, alami, dan siap dipakai supervisi Kepala Sekolah.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: promptText,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              temaModul: { type: Type.STRING, description: "Judul/Tema pokok modul ajar" },
+              alokasiWaktu: { type: Type.STRING, description: "e.g. 2 x 45 Menit (1 Sesi Pertemuan)" },
+              targetPesertaDidik: { type: Type.STRING, description: "Siswa reguler Fase E (Kelas X)" },
+              modelPembelajaran: { type: Type.STRING, description: "e.g. Tatap Muka Terpadu (Deep Learning)" },
+              saranaPrasarana: { type: Type.STRING, description: "Kebutuhan peranti, proyektor, kertas flipchart" },
+              temuKe: { type: Type.STRING, description: "Pertemuan ke-1" },
+              kompetensiAwal: { type: Type.STRING, description: "Mata rantai kompetensi awal murid sebelum memulai kelas" },
+              tujuanPembelajaran: { type: Type.STRING, description: "Deskripsi tujuan pembelajaran instruksional utama yang komprehensif" },
+              pemahamanBermakna: { type: Type.STRING, description: "Pemahaman kontekstual jangka panjang yang akan didapat siswa" },
+              pertanyaanPemantik: { type: Type.STRING, description: "Pertanyaan reflektif pemicu ketertarikan belajar siswa" },
+              kegiatanPembelajaran: {
+                type: Type.OBJECT,
+                properties: {
+                  pendahuluan: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "3 poin skenario pendahuluan (misal: salam, apersepsi, kaitan materi)"
+                  },
+                  intiDeepLearning: {
+                    type: Type.OBJECT,
+                    properties: {
+                      mindfulEngagement: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                        description: "3 aksi konkret pemicu atensi luring"
+                      },
+                      deepProcessing: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                        description: "3 aktivitas kritis-reflektif konseptual luring"
+                      },
+                      transferOfLearning: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                        description: "3 langkah penerapan nyata & peer review luring"
+                      }
+                    },
+                    required: ["mindfulEngagement", "deepProcessing", "transferOfLearning"]
+                  },
+                  penutup: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "3 poin penutup, metakognisi, penguatan materi harian"
+                  }
+                },
+                required: ["pendahuluan", "intiDeepLearning", "penutup"]
+              },
+              diferensiasi: {
+                type: Type.OBJECT,
+                properties: {
+                  konten: { type: Type.STRING, description: "Diferensiasi berdasarkan kesiapan belajar murid" },
+                  proses: { type: Type.STRING, description: "Variansi proses bimbingan per kelompok belajar" },
+                  produk: { type: Type.STRING, description: "Variasi media hasil unjuk kerja modular" }
+                },
+                required: ["konten", "proses", "produk"]
+              }
+            },
+            required: [
+              "temaModul",
+              "alokasiWaktu",
+              "targetPesertaDidik",
+              "modelPembelajaran",
+              "saranaPrasarana",
+              "temuKe",
+              "kompetensiAwal",
+              "tujuanPembelajaran",
+              "pemahamanBermakna",
+              "pertanyaanPemantik",
+              "kegiatanPembelajaran",
+              "diferensiasi"
+            ]
+          }
+        }
+      });
+
+      const responseText = response.text || "{}";
+      const optimizedModul = JSON.parse(responseText);
+
+      return res.json({ success: true, optimizedModul });
+    } catch (error: any) {
+      console.error("Gemini Generate Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Generasi Proyek Kokurikuler
+  app.post("/api/gemini/generate-kokurikuler", async (req, res) => {
+    try {
+      const { tema, jenjang, jurusan, jumlahMinggu } = req.body;
+
+      if (!tema) {
+        return res.status(400).json({ success: false, error: "Tema proyek is required" });
+      }
+
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({
+          success: false,
+          error: "GEMINI_API_KEY environment variable is not configured yet.",
+        });
+      }
+
+      const jenjangText = jenjang || "SMA";
+      const jurusanText = jurusan ? `Jurusan ${jurusan}` : "";
+      const mingguText = jumlahMinggu || 8;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Hasilkan rancangan proyek kokurikuler untuk ${jenjangText} ${jurusanText} dengan tema "${tema}" selama ${mingguText} minggu.
+Buat proyek yang bersifat lintas disiplin, kontekstual, dan mengembangkan 8 Dimensi Profil Lulusan (Keimanan dan Ketakwaan, Kewargaan, Penalaran Kritis, Kreativitas, Kolaborasi, Kemandirian, Kesehatan, Komunikasi).
+Gunakan bahasa formal akademik Indonesia.`,
+        config: {
+          systemInstruction: "Anda adalah pengembang kurikulum profesional Indonesia. Jawaban HARUS berupa objek JSON valid tanpa markdown.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              judulProyek: { type: Type.STRING, description: "Judul proyek kokurikuler yang menarik dan kontekstual" },
+              tujuan: { type: Type.STRING, description: "Tujuan proyek yang jelas dan terukur" },
+              dimensi: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "Daftar dimensi profil lulusan yang relevan (pilih dari 8 dimensi)"
+              },
+              timeline: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    minggu: { type: Type.STRING, description: "Nomor minggu" },
+                    aktivitas: { type: Type.STRING, description: "Deskripsi aktivitas mingguan" }
+                  },
+                  required: ["minggu", "aktivitas"]
+                },
+                description: "Timeline kegiatan per minggu"
+              },
+              asesmenAwal: { type: Type.STRING, description: "Bentuk asesmen diagnostik/awal" },
+              asesmenProses: { type: Type.STRING, description: "Bentuk asesmen formatif selama proses" },
+              asesmenAkhir: { type: Type.STRING, description: "Bentuk asesmen sumatif akhir" },
+              rubrikAsesmen: { type: Type.STRING, description: "Kriteria rubrik penilaian proyek" },
+              narasiRapor: { type: Type.STRING, description: "Narasi deskriptif capaian proyek untuk rapor" },
+            },
+            required: ["judulProyek", "tujuan", "dimensi", "timeline", "asesmenAwal", "asesmenProses", "asesmenAkhir", "rubrikAsesmen", "narasiRapor"]
+          }
+        }
+      });
+
+      const responseText = response.text || "{}";
+      const proyek = JSON.parse(responseText);
+      return res.json({ success: true, proyek });
+    } catch (error: any) {
+      console.error("Gemini Kokurikuler Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Generate Aktivitas dari Jenis Pengalaman Belajar
+  app.post("/api/gemini/generate-aktivitas", async (req, res) => {
+    try {
+      const { experience, temaModul, mapel } = req.body;
+      if (!experience) return res.status(400).json({ success: false, error: "Jenis experience is required" });
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({ success: false, error: "GEMINI_API_KEY not configured." });
+      }
+      const experienceLabels: Record<string, string> = {
+        observasi: "Observasi — Mengamati fenomena nyata",
+        diskusi: "Diskusi — Dialog kelompok terstruktur",
+        praktik: "Praktik — Latihan langsung keterampilan",
+        eksperimen: "Eksperimen — Uji coba dan pembuktian",
+        presentasi: "Presentasi — Paparan hasil kerja",
+        proyek: "Proyek — Tugas kompleks terpadu",
+        simulasi: "Simulasi — Peran dan skenario tiruan",
+      };
+      const label = experienceLabels[experience] || experience;
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Hasilkan 1-2 kalimat deskripsi aktivitas pembelajaran untuk jenis pengalaman "${label}" pada modul dengan tema "${temaModul || 'Pembelajaran'}" mata pelajaran ${mapel || "Informatika"}.
+
+Tulis dalam bahasa Indonesia formal, langsung siap pakai sebagai langkah kegiatan di kelas. Fokus pada deskripsi konkret apa yang dilakukan siswa.
+
+Contoh:
+- Observasi: "Siswa mengamati fenomena [topik] di lingkungan sekitar dan mencatat temuan awal pada lembar observasi."
+- Diskusi: "Siswa berdiskusi dalam kelompok kecil untuk menganalisis [topik] menggunakan panduan pertanyaan terstruktur."
+- Praktik: "Siswa mempraktikkan langsung [keterampilan] secara mandiri dengan bimbingan guru."
+
+Keluarkan HANYA teks aktivitasnya saja, 1-2 kalimat, tanpa label atau markdown.`,
+        config: {
+          systemInstruction: "Anda adalah guru profesional Indonesia. Hasilkan teks aktivitas singkat 1-2 kalimat. Jawaban HANYA teks biasa, tanpa markdown atau label.",
+          temperature: 0.8,
+        }
+      });
+      const text = (response.text || "").trim();
+      return res.json({ success: true, text });
+    } catch (error: any) {
+      console.error("Gemini Aktivitas Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Generate Rubrik Asesmen
+  app.post("/api/gemini/generate-rubrik", async (req, res) => {
+    try {
+      const { modul, mapel } = req.body;
+      if (!modul) return res.status(400).json({ success: false, error: "Data modul is required" });
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({ success: false, error: "GEMINI_API_KEY not configured." });
+      }
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Buat rubrik asesmen untuk modul ajar berikut.
+
+Mapel: ${mapel || "Informatika"}
+Tema Modul: ${modul.temaModul || "-"}
+Tujuan Pembelajaran: ${modul.tujuanPembelajaran || "-"}
+
+Buat 3 bagian:
+1. Asesmen Diagnostik — cara mengetahui kemampuan awal siswa
+2. Asesmen Formatif — teknik penilaian selama proses pembelajaran
+3. Asesmen Sumatif — teknik penilaian akhir capaian
+
+Setiap bagian berupa paragraf 2-3 kalimat yang siap pakai. Gunakan bahasa formal Indonesia.`,
+        config: {
+          systemInstruction: "Anda adalah ahli asesmen pendidikan Indonesia. Jawaban HARUS berupa objek JSON valid tanpa markdown.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              diagnostik: { type: Type.STRING, description: "Paragraf asesmen diagnostik" },
+              formatif: { type: Type.STRING, description: "Paragraf asesmen formatif" },
+              sumatif: { type: Type.STRING, description: "Paragraf asesmen sumatif" }
+            },
+            required: ["diagnostik", "formatif", "sumatif"]
+          }
+        }
+      });
+      const responseText = response.text || "{}";
+      const rubrik = JSON.parse(responseText);
+      return res.json({ success: true, rubrik });
+    } catch (error: any) {
+      console.error("Gemini Rubrik Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Review Modul & Score
+  app.post("/api/gemini/review-modul", async (req, res) => {
+    try {
+      const { modul, mapel } = req.body;
+      if (!modul) return res.status(400).json({ success: false, error: "Data modul is required" });
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({ success: false, error: "GEMINI_API_KEY not configured." });
+      }
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Review modul ajar berikut dan beri skor serta saran perbaikan.
+
+Mapel: ${mapel || "Informatika"}
+Data Modul (JSON): ${JSON.stringify(modul, null, 2)}
+
+Evaluasi dari 5 aspek:
+1. Identitas & Tujuan (kelengkapan tema, waktu, TP)
+2. Kompetensi Awal & Pemantik (kualitas pemahaman bermakna, pertanyaan pemantik)
+3. Aktivitas Mindful (kualitas mindful engagement)
+4. Aktivitas Meaningful (kualitas deep processing)
+5. Aktivitas Joyful & Penutup (kualitas transfer of learning, penutup)
+
+Beri skor 0-100 tiap aspek dan 2-3 saran perbaikan spesifik per aspek.`,
+        config: {
+          systemInstruction: "Anda adalah supervisor akademik yang mengevaluasi modul ajar. Jawaban HARUS berupa objek JSON valid tanpa markdown.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              scores: {
+                type: Type.OBJECT,
+                properties: {
+                  identitas: { type: Type.INTEGER, description: "Skor kelengkapan identitas dan tujuan 0-100" },
+                  pemantik: { type: Type.INTEGER, description: "Skor kualitas kompetensi awal dan pemantik 0-100" },
+                  mindful: { type: Type.INTEGER, description: "Skor kualitas mindful engagement 0-100" },
+                  meaningful: { type: Type.INTEGER, description: "Skor kualitas deep processing 0-100" },
+                  joyful: { type: Type.INTEGER, description: "Skor kualitas joyful dan penutup 0-100" }
+                },
+                required: ["identitas", "pemantik", "mindful", "meaningful", "joyful"]
+              },
+              total: { type: Type.INTEGER, description: "Skor total rata-rata 0-100" },
+              suggestions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: "3-5 saran perbaikan spesifik"
+              }
+            },
+            required: ["scores", "total", "suggestions"]
+          }
+        }
+      });
+      const responseText = response.text || "{}";
+      const review = JSON.parse(responseText);
+      return res.json({ success: true, review });
+    } catch (error: any) {
+      console.error("Gemini Review Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Koreksi Seluruh Modul Ajar per Semester
+  app.post("/api/gemini/koreksi-modul", async (req, res) => {
+    try {
+      const { moduls, promes, atp, mapel, semester } = req.body;
+      if (!moduls || !Array.isArray(moduls)) {
+        return res.status(400).json({ success: false, error: "Data modul ajar is required" });
+      }
+      if (!promes || !promes.items) {
+        return res.status(400).json({ success: false, error: "Data PROMES is required" });
+      }
+
+      const sem = semester || "1";
+      const filteredPromes = promes.items.filter((item: any) => item.semester === sem);
+      const totalPromesJP = filteredPromes.reduce((sum: number, item: any) => sum + (item.alokasiWaktu || 0), 0);
+
+      const totalModulJP = moduls.reduce((sum: number, m: any) => {
+        const waktu = parseInt((m.alokasiWaktu || "").replace(/[^0-9]/g, ""), 10);
+        return sum + (isNaN(waktu) ? 0 : waktu);
+      }, 0);
+
+      const modulReports = moduls.map((m: any, idx: number) => {
+        const kp = m.kegiatanPembelajaran || {};
+        const hasPendahuluan = kp.pendahuluan?.some((s: string) => s?.trim() !== "");
+        const hasMindful = kp.intiDeepLearning?.mindfulEngagement?.some((s: string) => s?.trim() !== "");
+        const hasDeep = kp.intiDeepLearning?.deepProcessing?.some((s: string) => s?.trim() !== "");
+        const hasTransfer = kp.intiDeepLearning?.transferOfLearning?.some((s: string) => s?.trim() !== "");
+        const hasPenutup = kp.penutup?.some((s: string) => s?.trim() !== "");
+
+        const allFields: Record<string, { value: any; label: string }> = {
+          temaModul: { value: m.temaModul, label: "Tema Modul" },
+          temuKe: { value: m.temuKe, label: "Pertemuan Ke-" },
+          alokasiWaktu: { value: m.alokasiWaktu, label: "Alokasi Waktu" },
+          kompetensiAwal: { value: m.kompetensiAwal, label: "Kompetensi Awal" },
+          tujuanPembelajaran: { value: m.tujuanPembelajaran, label: "Tujuan Pembelajaran" },
+          pemahamanBermakna: { value: m.pemahamanBermakna, label: "Pemahaman Bermakna" },
+          pertanyaanPemantik: { value: m.pertanyaanPemantik, label: "Pertanyaan Pemantik" },
+          modelPembelajaran: { value: m.modelPembelajaran, label: "Model Pembelajaran" },
+          saranaPrasarana: { value: m.saranaPrasarana, label: "Sarana Prasarana" },
+          targetPesertaDidik: { value: m.targetPesertaDidik, label: "Target Peserta Didik" },
+          pendahuluan: { value: hasPendahuluan, label: "Keg. Pendahuluan" },
+          mindfulEngagement: { value: hasMindful, label: "Mindful Engagement" },
+          deepProcessing: { value: hasDeep, label: "Deep Processing" },
+          transferOfLearning: { value: hasTransfer, label: "Transfer of Learning" },
+          penutup: { value: hasPenutup, label: "Keg. Penutup" },
+          aksesmenDiagnostik: { value: m.aksesmen?.diagnostik, label: "Asesmen Diagnostik" },
+          aksesmenFormatif: { value: m.aksesmen?.formatif, label: "Asesmen Formatif" },
+          aksesmenSumatif: { value: m.aksesmen?.sumatif, label: "Asesmen Sumatif" },
+          diferensiasiKonten: { value: m.diferensiasi?.konten, label: "Diferensiasi Konten" },
+          diferensiasiProses: { value: m.diferensiasi?.proses, label: "Diferensiasi Proses" },
+          diferensiasiProduk: { value: m.diferensiasi?.produk, label: "Diferensiasi Produk" },
+          refleksiGuru: { value: m.refleksiGuru, label: "Refleksi Guru" },
+          refleksiSiswa: { value: m.refleksiSiswa, label: "Refleksi Siswa" },
+        };
+
+        const fieldStatus: Record<string, boolean> = {};
+        const missingFields: string[] = [];
+        for (const [key, info] of Object.entries(allFields)) {
+          const isEmpty = info.value === undefined || info.value === null || info.value === "" || info.value === false;
+          fieldStatus[key] = !isEmpty;
+          if (isEmpty) missingFields.push(info.label);
+        }
+
+        const total = Object.keys(fieldStatus).length;
+        const filled = Object.values(fieldStatus).filter(Boolean).length;
+        const completeness = Math.round((filled / total) * 100);
+
+        return { index: idx, tema: m.temaModul || `Modul ${idx + 1}`, completeness, missingFields, fieldStatus };
+      });
+
+      const tpList = (atp || []).map((a: any) => ({
+        kode: a.kode || "", tp: a.tujuanPembelajaran || "",
+      }));
+
+      const tpCoverage = {
+        total: tpList.length,
+        covered: 0,
+        detail: tpList.map((t: any) => {
+          const isCovered = moduls.some((m: any) => {
+            const tpText = m.tujuanPembelajaran || "";
+            if (!t.tp || !tpText) return false;
+            const terms = t.tp.split(" ").filter((w: string) => w.length > 4);
+            if (terms.length === 0) return true;
+            const matchCount = terms.filter((term: string) => tpText.toLowerCase().includes(term.toLowerCase())).length;
+            return matchCount >= Math.ceil(terms.length * 0.3);
+          });
+          return { kode: t.kode, tp: t.tp, covered: isCovered };
+        })
+      };
+      tpCoverage.covered = tpCoverage.detail.filter((d: any) => d.covered).length;
+
+      let summary = `Koreksi selesai. ${moduls.length} modul ajar diperiksa untuk semester ${sem === "2" ? "Genap" : "Ganjil"}.`;
+      if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY") {
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: `Buat laporan koreksi modul ajar singkat dan profesional berdasarkan data berikut:
+
+Mapel: ${mapel || "Informatika"}
+Semester: ${sem === "2" ? "Genap" : "Ganjil"}
+Jumlah modul: ${moduls.length}
+Total JP Modul: ${totalModulJP}
+Total JP PROMES: ${totalPromesJP}
+Kecocokan JP: ${totalModulJP === totalPromesJP ? "Sesuai" : `Tidak sesuai (selisih ${Math.abs(totalModulJP - totalPromesJP)} JP)`}
+
+Cakupan TP ATP: ${tpCoverage.covered}/${tpCoverage.total} terakomodir
+
+Laporan modul:
+${modulReports.map((r: any) => `Modul "${r.tema}": kelengkapan ${r.completeness}%, ${r.missingFields.length} field kosong (${r.missingFields.slice(0, 5).join(", ")})`).join("\n")}
+
+Tulis 2-3 paragraf singkat dalam bahasa Indonesia formal sebagai kesimpulan koreksi. Sebutkan kekuatan utama, kelemahan, dan saran prioritas perbaikan.`,
+            config: {
+              systemInstruction: "Anda adalah supervisor akademik yang memberikan laporan koreksi modul ajar. Jawaban singkat, padat, profesional.",
+              temperature: 0.7,
+            }
+          });
+          summary = response.text || summary;
+        } catch (aiErr) {
+          console.error("Gemini summary generation failed, using fallback:", aiErr);
+        }
+      }
+
+      return res.json({
+        success: true,
+        result: { totalModulJP, totalPromesJP, jpMatch: totalModulJP === totalPromesJP, modulReports, tpCoverage, summary }
+      });
+    } catch (error: any) {
+      console.error("Koreksi Modul Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: AI Generate Variasi Pesan Reminder WA
+  app.post("/api/gemini/generate-reminder", async (req, res) => {
+    try {
+      const { topic, teachers } = req.body;
+      if (!topic) return res.status(400).json({ success: false, error: "Topik pesan is required" });
+      if (!teachers || !Array.isArray(teachers) || teachers.length === 0) {
+        return res.status(400).json({ success: false, error: "Daftar guru is required" });
+      }
+
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({
+          success: false,
+          error: "GEMINI_API_KEY environment variable is not configured yet.",
+        });
+      }
+
+      const teachersText = teachers.map((t: any, i: number) =>
+        `Guru ${i + 1}: Nama=${t.nama}, Mapel=${t.mapel}, Progress=${t.progressRata}%, Kekurangan=${t.kekurangan}`
+      ).join("\n");
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Buat pesan WhatsApp reminder untuk setiap guru berikut. Topik: "${topic}".
+
+Data guru:
+${teachersText}
+
+Aturan:
+1. Setiap guru mendapat pesa UNIK — pembuka variatif (Yth. / Kepada Yth. / Assalamualaikum / Salam hormat), struktur kalimat berbeda, pilihan sinonim berbeda, penempatan nama bisa di awal/tengah/akhir.
+2. Inti pesa HARUS: menyebut progress rata-rata guru saat ini, menyebut 2-3 bagian administrasi yang nilainya paling rendah, dan ajakan/himbauan untuk melengkapi sesuai topik.
+3. Tutup dengan salam yang variatif (Terima kasih / Hormat kami / Wassalamualaikum / Atas perhatiannya diucapkan terima kasih).
+4. Bahasa Indonesia formal namun hangat, tidak kaku.`,
+        config: {
+          systemInstruction: "Anda adalah admin sekolah yang bertugas mengirim pengingat ke para guru. Jawaban HARUS berupa array JSON valid tanpa markdown.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                teacherIndex: { type: Type.INTEGER, description: "Index guru sesuai urutan input (0-based)" },
+                message: { type: Type.STRING, description: "Pesan WA unik untuk guru tersebut, maksimal 500 karakter" }
+              },
+              required: ["teacherIndex", "message"]
+            }
+          }
+        }
+      });
+
+      const responseText = response.text || "[]";
+      const reminders = JSON.parse(responseText);
+      return res.json({ success: true, reminders });
+    } catch (error: any) {
+      console.error("Gemini Reminder Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: RPE AI Recommendation
+  app.post("/api/gemini/generate-rpe-recommendation", async (req, res) => {
+    try {
+      const { totalPekan, totalTidakEfektif, jpPerMinggu, jamEfektif } = req.body;
+
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        return res.json({ recommendation: "AI tidak dikonfigurasi. Pastikan GEMINI_API_KEY terisi." });
+      }
+
+      const prompt = `Berikut data Rencana Pekan Efektif (RPE):
+- Total Pekan Semester: ${totalPekan} pekan
+- Total Pekan Tidak Efektif: ${totalTidakEfektif} pekan
+- Pekan Efektif: ${Math.max(0, totalPekan - totalTidakEfektif)} pekan
+- JP per Minggu: ${jpPerMinggu} JP
+- Jam Efektif: ${jamEfektif} JP
+
+Beri rekomendasi singkat (maks 2 kalimat) dalam bahasa Indonesia. Jika pekan tidak efektif terlalu besar (lebih dari 40% dari total pekan), beri peringatan dan saran penyesuaian. Jika wajar, beri semangat.`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt,
+        config: {
+          systemInstruction: "Anda asisten akademik sekolah yang membantu guru menganalisis RPE. Jawab singkat, padat, dalam bahasa Indonesia.",
+        }
+      });
+
+      return res.json({ recommendation: response.text || "Analisis selesai." });
+    } catch (error: any) {
+      console.error("RPE AI Error:", error);
+      return res.json({ recommendation: "Gagal mendapatkan rekomendasi AI." });
+    }
+  });
+
+  // API Route: Parse PDF Calendar via AI
+  app.post("/api/gemini/parse-pdf", upload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ success: false, error: "File PDF diperlukan" });
+      if (req.file.mimetype && !req.file.mimetype.includes("pdf")) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ success: false, error: "Format file harus PDF" });
+      }
+
+      if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(500).json({ success: false, error: "GEMINI_API_KEY environment variable is not configured yet." });
+      }
+
+      const pdfBuffer = fs.readFileSync(req.file.path);
+      const pdfData = await pdfParse(pdfBuffer);
+      const pdfText = pdfData.text;
+
+      if (!pdfText || pdfText.trim().length < 20) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ success: false, error: "Tidak dapat membaca teks dari PDF. Pastikan PDF bukan hasil scan/gambar." });
+      }
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Berikut adalah teks dari kalender pendidikan tahunan pemerintah Indonesia. Ekstrak semua kegiatan dan hari libur akademik ke dalam format JSON terstruktur.
+
+TEKS KALENDER:
+${pdfText}
+
+Aturan ekstraksi:
+- Baca SELURUH teks dengan teliti, cari semua tanggal dan kegiatan
+- Kategorikan kegiatan: "libur" untuk libur nasional/cuti bersama/libur sekolah, "akademik" untuk kegiatan pembelajaran/hari efektif, "asesmen" untuk ujian/penilaian/asesmen, "sekolah" untuk kegiatan seremonial/khusus sekolah
+- Format tanggal: YYYY-MM-DD. Untuk rentang gunakan "tanggal" (mulai) dan "tanggalSelesai" (akhir)
+- Judul kegiatan gunakan bahasa Indonesia yang baku
+- Cantumkan deskripsi singkat jika ada keterangan tambahan
+- Jangan membuat data palsu. Jika teks tidak mengandung informasi kegiatan yang jelas, skip.
+- Pastikan BULAN dan TANGGAL sesuai konteks (misal Juli 2026, Agustus 2026, dst)`,
+        config: {
+          systemInstruction: "Anda asisten administrasi sekolah yang teliti. Ekstrak kalender akademik dari PDF ke JSON array. Jawab HANYA array JSON valid, tanpa markdown atau teks lain.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                tanggal: { type: Type.STRING, description: "Tanggal mulai kegiatan (YYYY-MM-DD)" },
+                tanggalSelesai: { type: Type.STRING, description: "Tanggal selesai jika multi-hari (YYYY-MM-DD), kosongkan jika satu hari" },
+                kegiatan: { type: Type.STRING, description: "Nama kegiatan/kalender" },
+                deskripsi: { type: Type.STRING, description: "Keterangan tambahan jika ada" },
+                kategori: { type: Type.STRING, enum: ["libur", "akademik", "asesmen", "sekolah"], description: "Kategori kegiatan" }
+              },
+              required: ["tanggal", "kegiatan", "kategori"]
+            }
+          }
+        }
+      });
+
+      const raw = JSON.parse(response.text || "[]");
+      if (!Array.isArray(raw)) throw new Error("Response bukan array");
+
+      const agenda = raw.map((item: any, i: number) => ({
+        id: "pdf_" + Date.now() + "_" + i,
+        tanggal: item.tanggal,
+        ...(item.tanggalSelesai ? { tanggalSelesai: item.tanggalSelesai } : {}),
+        kegiatan: item.kegiatan,
+        ...(item.deskripsi ? { deskripsi: item.deskripsi } : {}),
+        kategori: (["libur", "akademik", "asesmen", "sekolah"].includes(item.kategori) ? item.kategori : "sekolah")
+      }));
+
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.json({ success: true, agenda });
+    } catch (error: any) {
+      if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+      console.error("PDF Parse Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // API Route: Send WhatsApp via Fonnte
+  app.post("/api/send-wa", async (req, res) => {
+    try {
+      const { token, targets, message } = req.body;
+      if (!token) return res.status(400).json({ success: false, error: "Token Fonnte tidak disertakan." });
+      if (!targets || !Array.isArray(targets) || targets.length === 0) {
+        return res.status(400).json({ success: false, error: "Target penerima tidak valid." });
+      }
+      if (!message) return res.status(400).json({ success: false, error: "Pesan tidak boleh kosong." });
+
+      const targetStr = targets.join(",");
+      const params = new URLSearchParams({ target: targetStr, message });
+
+      const response = await fetch("https://api.fonnte.com/send", {
+        method: "POST",
+        headers: {
+          "Authorization": token,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: params.toString()
+      });
+
+      const data = await response.json();
+      console.log("Fonnte response:", data);
+
+      if (data.status === true || data.status === "true") {
+        return res.json({ success: true, sent: targets.length, detail: data });
+      } else {
+        return res.json({ success: false, error: data.reason || data.detail || "Gagal mengirim via Fonnte." });
+      }
+    } catch (error: any) {
+      console.error("Fonnte Error:", error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // Test route: simple DOCX generation
+  app.get("/api/test-docx", async (_req, res) => {
+    try {
+      const testHtml = "<p>Hello World</p><p>Test DOCX generation</p>";
+      const buf = await HTMLtoDOCX(testHtml, undefined, {
+        font: "Calibri",
+        fontSize: 22,
+        title: "Test Document",
+        margins: PAGE_MARGINS_TWIP
+      });
+      console.log("TEST DOCX: type:", typeof buf, "isBuffer:", Buffer.isBuffer(buf), "length:", buf?.length || buf?.byteLength);
+      if (buf) {
+        const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+        console.log("TEST DOCX: first bytes:", b.slice(0, 4).toString("hex"));
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        res.setHeader("Content-Disposition", "attachment; filename=test.docx");
+        res.send(b);
+      } else {
+        res.status(500).json({ error: "No buffer returned" });
+      }
+    } catch (e: any) {
+      console.error("TEST DOCX Error:", e);
+      res.status(500).json({ error: e.message, stack: e.stack });
+    }
+  });
+
+  // API Route: Export HTML to DOCX
+  app.post("/api/export-docx", async (req, res) => {
+    try {
+      const rawHtml = req.body?.html;
+      if (!rawHtml) return res.status(400).json({ success: false, error: "HTML content is required" });
+      console.log("DOCX: HTML received, length:", rawHtml.length, "first 200 chars:", rawHtml.slice(0, 200));
+      console.log("DOCX: Calling HTMLtoDOCX library...");
+      const orientation = req.body?.orientation === "landscape" ? "landscape" : "portrait";
+      console.log("DOCX: orientation:", orientation);
+      const pageSize = { width: 11906, height: 18709 };
+      const docxBuffer = await HTMLtoDOCX(rawHtml, undefined, {
+        orientation: orientation,
+        pageSize: pageSize,
+        margins: PAGE_MARGINS_TWIP,
+        title: "Portofolio Administrasi Guru",
+        creator: "Sistem Informasi Administrasi Sekolah (SIAS)",
+        font: "Times New Roman",
+        fontSize: 22,
+        table: { row: { cantSplit: true } }
+      });
+      console.log("DOCX: Library returned type:", typeof docxBuffer, "isBuffer:", Buffer.isBuffer(docxBuffer), "length:", docxBuffer?.length || docxBuffer?.byteLength);
+      const buf = Buffer.isBuffer(docxBuffer) ? docxBuffer : Buffer.from(docxBuffer);
+      console.log("DOCX: final length:", buf.length);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      res.setHeader("Content-Disposition", "attachment; filename=portofolio_guru.docx");
+      res.send(buf);
+    } catch (error: any) {
+      console.error("Export DOCX Error:", error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  // ─── CRON JOB ENDPOINTS ───
+  app.get("/api/cron/list", (_req, res) => {
+    res.json({ success: true, jobs: loadCronJobs() });
+  });
+  app.post("/api/cron/create", (req, res) => {
+    try {
+      const { name, topic, teacherIds, daysOfWeek, time, fonnteToken, teacherData } = req.body;
+      if (!name || !topic || !time || !daysOfWeek?.length) {
+        return res.status(400).json({ success: false, error: "Field required: name, topic, time, daysOfWeek" });
+      }
+      const record: CronJobRecord = {
+        id: crypto.randomUUID(),
+        name, topic, teacherIds: teacherIds || [],
+        daysOfWeek, time,
+        enabled: true,
+        createdAt: new Date().toISOString(),
+        lastRunAt: null, lastStatus: null, lastMessage: null,
+        fonnteToken: fonnteToken || "",
+        teacherData: teacherData || []
+      };
+      const jobs = loadCronJobs();
+      jobs.push(record);
+      saveCronJobs(jobs);
+      cronScheduler.init(jobs);
+      res.json({ success: true, job: record });
+    } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+  app.post("/api/cron/:id/toggle", (req, res) => {
+    try {
+      const jobs = loadCronJobs();
+      const idx = jobs.findIndex(j => j.id === req.params.id);
+      if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
+      jobs[idx].enabled = !jobs[idx].enabled;
+      saveCronJobs(jobs);
+      cronScheduler.init(jobs);
+      res.json({ success: true, job: jobs[idx] });
+    } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+  app.post("/api/cron/:id/sync", (req, res) => {
+    try {
+      const { teacherData, fonnteToken } = req.body;
+      const jobs = loadCronJobs();
+      const idx = jobs.findIndex(j => j.id === req.params.id);
+      if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
+      if (teacherData) jobs[idx].teacherData = teacherData;
+      if (fonnteToken) jobs[idx].fonnteToken = fonnteToken;
+      saveCronJobs(jobs);
+      res.json({ success: true, job: jobs[idx] });
+    } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+  app.delete("/api/cron/:id", (req, res) => {
+    try {
+      let jobs = loadCronJobs();
+      const idx = jobs.findIndex(j => j.id === req.params.id);
+      if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
+      jobs.splice(idx, 1);
+      saveCronJobs(jobs);
+      cronScheduler.init(jobs);
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+
+  // Serve static UI assets / route handling in development or production
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server is running with Express and Vite at http://localhost:${PORT}`);
+  });
+  // Init cron scheduler with persisted jobs
+  cronScheduler.init(loadCronJobs());
+}
+
+startServer();

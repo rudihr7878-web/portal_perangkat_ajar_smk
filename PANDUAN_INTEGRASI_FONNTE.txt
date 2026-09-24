@@ -1,0 +1,247 @@
+================================================================================
+  PANDUAN INTEGRASI FONNTE - WhatsApp Gateway
+  Portal Administrasi Guru Tahunan
+  Terakhir diperbarui: Juli 2026
+================================================================================
+
+Daftar Isi
+----------
+1. Tentang Fonnte
+2. Persiapan Akun & Token
+3. Arsitektur Integrasi
+4. Endpoint Server: /api/send-wa
+5. Cara Pakai dari Frontend
+6. Cron Job (Pesan Otomatis Terjadwal)
+7. Troubleshooting
+8. Referensi API Fonnte
+
+================================================================================
+1. TENTANG FONNTE
+================================================================================
+
+Fonnte adalah layanan WhatsApp Gateway berbasis REST API.
+Keunggulan:
+- Tidak perlu scan QR / login WhatsApp Web
+- REST API sederhana (POST)
+- Mendukung kirim pesan ke nomor tunggal atau batch
+- Berbayar per pesan (token-based billing)
+- Dashboard untuk monitoring pengiriman
+
+Situs resmi: https://fonnte.com
+Dokumentasi API: https://fonnte.com/api
+
+================================================================================
+2. PERSIAPAN AKUN & TOKEN
+================================================================================
+
+Langkah mendapatkan Token:
+
+a) Daftar akun di https://fonnte.com
+b) Login ke dashboard Fonnte
+c) Salin API Token dari dashboard (biasanya di menu "API" atau "Setting")
+   Token berformat string panjang, contoh: "aBcDeFgHiJkLmNoPqRsTuVwXyZ123456"
+d) Simpan token di Admin Panel > Akun Admin > Fonnte Token
+
+Token ini dikirim di header setiap request:
+  Authorization: <token Anda>
+
+================================================================================
+3. ARSITEKTUR INTEGRASI
+================================================================================
+
+Frontend (React)
+       |
+       | POST /api/send-wa
+       | Body: { token, targets[], message }
+       v
+  Server (Express)
+       |
+       | fetch("https://api.fonnte.com/send", {
+       |   method: "POST",
+       |   headers: {
+       |     "Authorization": token,
+       |     "Content-Type": "application/x-www-form-urlencoded"
+       |   },
+       |   body: "target=0812xxxx,0856xxxx&message=Halo..."
+       | })
+       v
+  Fonnte API Server
+       |
+       v
+  WhatsApp (Pesan terkirim ke nomor target)
+
+================================================================================
+4. ENDPOINT SERVER: /api/send-wa
+================================================================================
+
+URL:    POST /api/send-wa
+Auth:   Tidak ada auth tambahan (token Fonnte dikirim dari frontend)
+
+Request Body (JSON):
+{
+  "token": "string",       // Token Fonnte dari admin config
+  "targets": ["string"],   // Array nomor HP (format: 628xxxxxxxxxx)
+  "message": "string"      // Teks pesan WhatsApp
+}
+
+Contoh request:
+{
+  "token": "aBcDeFgHiJkLmNoPqRsTuVwXyZ123456",
+  "targets": ["6281234567890", "6285678901234"],
+  "message": "Assalamualaikum Bpk/Ibu, mohon lengkapi administrasi minggu ini."
+}
+
+Response (sukses):
+{
+  "success": true,
+  "sent": 2,
+  "detail": { "status": true, "message": "5088596120", ... }
+}
+
+Response (gagal):
+{
+  "success": false,
+  "error": "Invalid token"
+}
+
+Catatan Penting:
+- Nomor HP harus format internasional tanpa simbol: 628xxxxxxxxxx
+- Satu request bisa kirim ke beberapa nomor sekaligus (comma-separated di target)
+- Untuk pesan UNIK per guru (reminder AI), kirim 1 request per guru dalam loop
+
+================================================================================
+5. CARA PAKAI DARI FRONTEND
+================================================================================
+
+a) Kirim Pesan Manual (satu pesan ke beberapa nomor):
+
+   const res = await fetch("/api/send-wa", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+     body: JSON.stringify({
+       token: fonnteToken,
+       targets: ["6281234567890"],
+       message: "Halo, ini pesan pengingat."
+     })
+   });
+   const data = await res.json();
+   // data.success === true jika terkirim
+
+b) Kirim Pesan Unik per Guru (Loop):
+
+   // reminders = [{ teacherIndex: 0, message: "..." }, ...]
+   for (const r of reminders) {
+     const guru = daftarGuru[r.teacherIndex];
+     await fetch("/api/send-wa", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({
+         token: fonnteToken,
+         targets: [guru.telepon],
+         message: r.message  // pesan unik dari AI
+       })
+     });
+   }
+
+c) Token diambil dari admin config:
+
+   // Di frontend
+   const config = loadAdminMasterConfig();
+   const fonnteToken = config.fonnteToken;
+
+================================================================================
+6. CRON JOB (PESAN OTOMATIS TERJADWAL)
+================================================================================
+
+Sistem mendukung pengiriman pesan WhatsApp otomatis via Cron Job.
+
+a) Membuat Cron Job:
+   POST /api/cron/create
+   Body:
+   {
+     "name": "Reminder Senin",
+     "topic": "Lengkapi Administrasi",
+     "teacherIds": ["t1", "t2"],    // Kosongkan untuk semua guru
+     "daysOfWeek": [1],             // 0=Minggu, 1=Senin, ..., 6=Sabtu
+     "time": "08:00",               // Format 24 jam HH:MM
+     "fonnteToken": "tokenAnda",
+     "teacherData": [               // Snapshot data guru saat create
+       { "nama": "Pak Budi", "mapel": "Informatika", "telepon": "62812xxxxx",
+         "progressRata": 65, "kekurangan": "Diferensiasi, Asesmen" }
+     ]
+   }
+
+b) Mengaktifkan/Mematikan Cron Job:
+   POST /api/cron/:id/toggle
+
+c) Sinkronisasi Data Guru (update progress terbaru):
+   POST /api/cron/:id/sync
+
+d) Menghapus Cron Job:
+   DELETE /api/cron/:id
+
+e) Cron Job tersimpan di file: cron_jobs.json (otomatis di-reload saat server restart)
+
+================================================================================
+7. TROUBLESHOOTING
+================================================================================
+
+Masalah: Pesan tidak terkirim
+- Cek token Fonnte valid (masih aktif, saldo mencukupi)
+- Cek format nomor HP: harus 628xxxxxxxxxx (tanpa + atau spasi)
+- Cek console server untuk log error Fonnte
+- Pastikan target nomor terdaftar di WhatsApp
+
+Masalah: "Invalid token" dari Fonnte
+- Token salah atau kedaluwarsa
+- Saldo Fonnte habis
+- Akun Fonnte tidak aktif
+
+Masalah: Server error
+- Pastikan GEMINI_API_KEY terkonfigurasi (untuk reminder AI)
+- Cek apakah Fonnte API dapat diakses dari server
+- Pastikan node-fetch / fetch tersedia di Node.js
+
+Masalah: Cron Job tidak jalan
+- Cek apakah server sedang berjalan
+- Cek file cron_jobs.json di root project
+- Toggle cron job (enable/disable) untuk restart scheduler
+
+================================================================================
+8. REFERENSI API FONNTE
+================================================================================
+
+Endpoint: https://api.fonnte.com/send
+Method:   POST
+Headers:
+  Authorization: <token>
+  Content-Type:  application/x-www-form-urlencoded
+
+Body (URL-encoded):
+  target  = nomor1,nomor2    (comma-separated, format 628xxx)
+  message = teks pesan
+
+Response:
+  { "status": true, "message": "5088596120" }
+  { "status": false, "reason": "Invalid token" }
+
+Dokumentasi lengkap: https://fonnte.com/api
+Dashboard: https://fonnte.com/dashboard
+
+================================================================================
+  CATATAN IMPLEMENTASI DI PROJECT INI
+================================================================================
+
+File yang menggunakan Fonnte:
+- server.ts (baris 697-731): endpoint /api/send-wa
+- server.ts (baris 117-133): cron job executor (kirim via Fonnte)
+- MonitoringPanel.tsx: UI reminder WA, broadcast WA, cron job manager
+
+Data flow:
+1. Admin memasukkan Fonnte Token di Panel Admin > Akun Admin
+2. Token disimpan di localStorage (sim_guru_admin_master)
+3. Frontend membaca token dan mengirimkannya ke /api/send-wa
+4. Server meneruskan ke Fonnte API dengan header Authorization
+5. Fonnte mengirim pesan WhatsApp ke nomor target
+
+================================================================================

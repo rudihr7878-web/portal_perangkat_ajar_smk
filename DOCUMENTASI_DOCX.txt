@@ -1,0 +1,106 @@
+============================================================
+  DOKUMENTASI - EXPORT / GENERATE FILE DOCX
+  Portal Administrasi Guru Tahunan
+============================================================
+
+1. FRAMEWORK
+   - Frontend: React 19 + TypeScript + Vite 6 + Tailwind CSS 4
+   - Backend:  Express.js (server.ts) via tsx (dev) / esbuild (prod)
+   - Server entry: server.ts (dijalankan dengan `tsx server.ts`)
+
+2. LIBRARY UTAMA (DOCX)
+   - Nama: html-to-docx
+   - Versi: ^1.8.0 (terinstal di node_modules/html-to-docx)
+   - Repo: https://github.com/privateOmega/html-to-docx
+   - Fungsi: Mengkonversi HTML string menjadi file .docx (OpenXML)
+
+3. ALUR GENERATE DOCX
+
+   [Frontend] src/App.tsx — handleDownloadDocx()
+   ----------------------------------------------------
+   - Mengambil element DOM #main-content
+   - Clone node, hapus elemen dengan class "print:hidden"
+   - Hapus SVG (karena library tidak support)
+   - Kirim innerHTML via POST ke /api/export-docx
+
+   [Backend] server.ts — POST /api/export-docx
+   ----------------------------------------------------
+   - Terima rawHtml dari req.body.html
+   - Bungkus dalam <div> dengan inline style font family/size
+   - Panggil: HTMLtoDOCX(html, undefined, { options })
+   - Kirim buffer sebagai response dengan header:
+       Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+       Content-Disposition: attachment; filename=portofolio_guru.docx
+
+4. OPTIONS YANG DIKIRIM KE LIBRARY
+
+   {
+     orientation: "portrait",
+     margins: {
+       top: 1440,     // ~2.54cm  (1 inch)
+       right: 1440,   // ~2.54cm
+       bottom: 1440,  // ~2.54cm
+       left: 1800,    // ~3.18cm  (1.25 inch)
+       header: 850,   // ~1.5cm
+       footer: 850,   // ~1.5cm
+       gutter: 0      // 0cm
+     },
+     title: "Portofolio Administrasi Guru - SMAN 1 Bandung",
+     creator: "Sistem Informasi Administrasi Sekolah (SIAS)",
+     font: "Atkinson Hyperlegible",
+     fontSize: 22,
+     table: { row: { cantSplit: true } }
+   }
+
+   CATATAN: Margin dalam TWIP (Twentieths of a Point).
+   1 inch = 1440 TWIP, 1 cm = ~567 TWIP.
+   Menggunakan numeric TWIP langsung (bukan string "1.5cm")
+   untuk menghindari bug konversi satuan di library.
+
+5. BUG YANG PERNAH TERJADI
+
+   Masalah: File DOCX tidak bisa dibuka di Word, muncul
+   pesan "Word experienced an error trying to open the file"
+   atau "need to recovery".
+
+   Penyebab 1 (margin undefined):
+   - Margin value dikirim sebagai string cm ("1.5cm") yang
+     dikonversi library. Jika ada key margin tidak terisi,
+     atau konversi gagal, nilai "undefined" akan muncul di
+     XML output: w:header="undefined"
+   - Word gagal memparse XML karena "undefined" bukan angka.
+   - Fix: Kirim numeric TWIP langsung (PAGE_MARGINS_TWIP).
+
+   Penyebab 2 (binary ZIP di-string-replace):
+   - Fungsi sanitizeDocx() sebelumnya melakukan replace
+     string pada binary ZIP buffer, yang mengkorupsi arsip.
+   - Fix: Hapus fungsi tersebut, gunakan numeric TWIP.
+
+   Penyebab potensial (fixupMargin):
+   - Library html-to-docx punya fungsi fixupMargin() yang
+     hanya handle unit "pt" dan "px" (bukan "cm"/"in").
+   - Jika HTML content mengandung inline style margin
+     dengan cm/in, nilai undefined bisa bocor ke XML.
+   - Hindari inline style margin dengan cm/in di konten.
+
+6. TROUBLESHOOTING
+
+   Jika file DOCX tetap error:
+   a. Pastikan server sudah direstart setelah perubahan code
+   b. Cek console log server untuk error message
+   c. Test via /api/test-docx (GET) untuk verifikasi dasar
+   d. Periksa apakah HTML content mengandung elemen yang
+      tidak didukung library (SVG, canvas, dll)
+   e. Coba buka file dengan 7-Zip untuk periksa struktur ZIP
+   f. Extract word/document.xml untuk validasi XML
+
+7. FILE RELEVAN
+
+   - server.ts              -> Backend Express + DOCX endpoint
+   - src/App.tsx             -> Frontend React + handler download
+   - package.json            -> Dependencies
+   - node_modules/html-to-docx/ -> Library DOCX (v1.8.0)
+
+============================================================
+  END DOKUMENTASI
+============================================================

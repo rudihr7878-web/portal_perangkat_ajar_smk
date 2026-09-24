@@ -1,0 +1,6 @@
+{
+  "name": "Portal Administrasi Guru Tahunan",
+  "description": "Aplikasi lengkap administrasi guru tahunan Indonesia berbasis Kurikulum Merdeka dan pendekatan Deep Learning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

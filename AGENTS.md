@@ -48,7 +48,10 @@ AI-generated reminder/broadcast WhatsApp messages per teacher (with progress + k
 - Endpoint `/api/send-wa` hanya support 1 message ke 1 target (per guru) — untuk broadcast unik tiap guru, loop di frontend
 - Cron job tersimpan di DB key `cron_jobs` (fallback `cron_jobs.json`), di-schedule ulang otomatis saat server restart
 - `vite build` + `esbuild server.ts` sudah sukses; `npm run lint` (tsc --noEmit) hijau
-- Deploy: Vercel statis (`dist/`) + env `VITE_API_BASE_URL=https://<render>.onrender.com`; Render jalankan `node dist/server.cjs` + env `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY`/`GEMINI_API_KEY`/`CORS_ORIGIN`; ping `API_URL/api/health` tiap ~13 menit agar instance free tidak sleep
+- Deployment AKTIF: **Vercel serverless** (gratis) — URL `https://portal-perangkat-ajar-smk.vercel.app`, project `portal-perangkat-ajar-smk` (team `smk-f6d6`), terhubung GitHub `master` (auto-deploy tiap push). Frontend statis + API Express dalam satu fungsi `/api` via `vercel.json` rewrite → `api/index.js` (bundle mandiri hasil `esbuild scripts/serverless-entry.ts`, di-commit). `api/index.*` JANGAN dibuat pakai import relatif TS (`../server`) — Vercel ESM tidak resolve ekstensi; harus tetap versi bundle `.js`.
+- Env Vercel (production+preview+dev): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, opsional `CRON_TIMEZONE` (default Asia/Jakarta) & `CRON_TICK_TOKEN`. `VITE_API_BASE_URL` KOSONG (same-origin). Vercel build command: `npm run build` (vite + esbuild dist/server.cjs + api/index.js). CLI deploy: `npx vercel deploy --prod --token $env:VERCEL_TOKEN`.
+- **Cron tanpa instance selalu-nyala**: `node-cron` hanya aktif di mode persistent (`isMainModule()` true). Di Vercel gunakan `POST /api/cron-tick` yang dipicu dari luar (mis. cron-job.org tiap 1 menit) → menjalankan job yang jatuh tempo (zona `CRON_TIMEZONE`). Guard: `isServerless()` (VERCEL=1) mematikan `cronScheduler.init`; `isMainModule()` mencegah `startServer()` saat di-import.
+- Fallback/uCoba lokal: `npm run dev` (tsx server.ts, Vite + API port 3000) atau `node dist/server.cjs` (produksi persistent). `vercel dev` juga valid untuk menguji fungsi `/api` lokal.
 
 ## Relevant Files
 - `src/components/MonitoringPanel.tsx`: progress, AI reminder, AI broadcast, cron job, laporan

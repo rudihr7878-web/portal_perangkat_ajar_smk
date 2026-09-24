@@ -8,7 +8,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import os from "os";
-import { createServer as createViteServer } from "vite";
+import { fileURLToPath } from "url";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import HTMLtoDOCX from "html-to-docx";
@@ -72,6 +72,113 @@ async function saveCronJobs(jobs: CronJobRecord[]) {
   } catch (e) { console.error("Error saving cron jobs:", e); }
 }
 
+// ─── SERVERLESS HELPERS ───
+function isServerless(): boolean {
+  return process.env.VERCEL === "1";
+}
+
+/** Path file ini (kompatibel ESM tsx/source & CJS hasil esbuild). */
+const MODULE_FILE: string = (() => {
+  try { return fileURLToPath(import.meta.url); }
+  catch { return __filename as string; }
+})();
+
+/** True hanya saat file ini dijalankan langsung (node/tsx), bukan di-import (serverless). */
+function isMainModule(): boolean {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  try { return path.resolve(arg) === path.resolve(MODULE_FILE); }
+  catch { return !isServerless(); }
+}
+
+const CRON_TZ: string = process.env.CRON_TIMEZONE || "Asia/Jakarta";
+
+/** Potongan waktu (tahun/bulan/tanggal/jam/menit/hari) dalam zona waktu tertentu. */
+function tzParts(d: Date, tz: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find(p => p.type === t)?.value || "";
+  const week = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+  return {
+    y: Number(get("year")), mo: Number(get("month")), d: Number(get("day")),
+    h: get("hour") === "24" ? 0 : Number(get("hour")), mi: Number(get("minute")),
+    dow: week.indexOf(get("weekday").toLowerCase()),
+  };
+}
+
+/** Apakah job layak dijalankan pada menit ini (hari & jam cocok, belum dijalankan hari ini). */
+function isCronDue(job: CronJobRecord, now: Date): boolean {
+  if (!job.enabled || !job.time) return false;
+  const t = tzParts(now, CRON_TZ);
+  if (!job.daysOfWeek.includes(t.dow)) return false;
+  const nowMin = t.h * 60 + t.mi;
+  const [hh, mm] = job.time.split(":").map(Number);
+  if (nowMin !== (hh * 60 + (mm || 0))) return false;
+  if (job.lastRunAt) {
+    const lr = tzParts(new Date(job.lastRunAt), CRON_TZ);
+    if (lr.y === t.y && lr.mo === t.mo && lr.d === t.d && (lr.h * 60 + lr.mi) >= nowMin) return false;
+  }
+  return true;
+}
+
+/** Jalankan satu cron job: generate AI via Gemini + kirim WA via Fonnte, lalu persist status. */
+async function executeCronJobRecord(job: CronJobRecord) {
+  console.log(`Cron executing: ${job.name} (${job.id})`);
+  try {
+    const teachers = job.teacherData.map(t => ({
+      nama: t.nama, mapel: t.mapel,
+      progressRata: t.progressRata, kekurangan: t.kekurangan
+    }));
+    if (!teachers.length) throw new Error("No teacher data in cron job");
+    let reminders: { teacherIndex: number; message: string }[] = [];
+    try {
+      const resp = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: `Buat pesan WhatsApp reminder untuk ${teachers.length} guru berikut.\nTopik: "${job.topic}".\n\nData guru:\n${teachers.map((t: any, i: number) => `Guru ${i+1}: Nama=${t.nama}, Mapel=${t.mapel}, Progress=${t.progressRata}%, Kekurangan=${t.kekurangan}`).join("\n")}\n\nAturan:\n1. Setiap guru mendapat pesan UNIK (variasi pembuka/penutup/struktur).\n2. Sebut progress rata-rata dan 2-3 bagian terendah.\n3. Bahasa formal hangat Indonesia.`,
+        config: {
+          systemInstruction: "Anda admin sekolah. Jawaban array JSON tanpa markdown.",
+          responseMimeType: "application/json",
+          responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { teacherIndex: { type: Type.INTEGER }, message: { type: Type.STRING } }, required: ["teacherIndex", "message"] } }
+        }
+      });
+      reminders = JSON.parse(resp.text || "[]");
+    } catch (e: any) {
+      throw new Error(`Gemini error: ${e.message}`);
+    }
+    let sent = 0, failed = 0;
+    for (const r of reminders) {
+      const td = job.teacherData[r.teacherIndex];
+      if (!td || !td.telepon) { failed++; continue; }
+      try {
+        const params = new URLSearchParams({ target: td.telepon, message: r.message });
+        const resp = await fetch("https://api.fonnte.com/send", {
+          method: "POST",
+          headers: { "Authorization": job.fonnteToken, "Content-Type": "application/x-www-form-urlencoded" },
+          body: params.toString()
+        });
+        const data = await resp.json();
+        if (data.status === true || data.status === "true") sent++;
+        else failed++;
+      } catch { failed++; }
+    }
+    job.lastRunAt = new Date().toISOString();
+    job.lastStatus = "success";
+    job.lastMessage = `Terkirim: ${sent}, Gagal: ${failed}`;
+    console.log(`Cron ${job.name}: ${job.lastMessage}`);
+  } catch (e: any) {
+    job.lastStatus = "error";
+    job.lastMessage = e.message;
+    console.error(`Cron ${job.name} failed:`, e.message);
+  }
+  const all = await loadCronJobs();
+  const idx = all.findIndex(j => j.id === job.id);
+  if (idx >= 0) all[idx] = job; else all.push(job);
+  await saveCronJobs(all);
+  return job;
+}
+
 // ─── CRON SCHEDULER ───
 class CronScheduler {
   private tasks = new Map<string, ReturnType<typeof cron.schedule>>();
@@ -90,7 +197,7 @@ class CronScheduler {
     const [h, m] = job.time.split(":").map(Number);
     const expr = `${m} ${h} * * ${job.daysOfWeek.join(",")}`;
     try {
-      const task = cron.schedule(expr, () => this.executeJob(job.id));
+      const task = cron.schedule(expr, () => this.executeJob(job.id), { timezone: CRON_TZ });
       this.tasks.set(job.id, task);
     } catch (e) {
       console.error(`Failed to schedule cron ${job.id}:`, e);
@@ -103,62 +210,11 @@ class CronScheduler {
   }
 
   async executeJob(jobId: string) {
+    const job = this.jobs.find(j => j.id === jobId);
+    if (!job) return;
+    await executeCronJobRecord(job);
     const idx = this.jobs.findIndex(j => j.id === jobId);
-    if (idx === -1) return;
-    const job = this.jobs[idx];
-    console.log(`Cron executing: ${job.name} (${job.id})`);
-    job.lastStatus = null;
-    await saveCronJobs(this.jobs);
-    try {
-      // Generate AI messages using stored teacher data
-      const teachers = job.teacherData.map(t => ({
-        nama: t.nama, mapel: t.mapel,
-        progressRata: t.progressRata, kekurangan: t.kekurangan
-      }));
-      if (!teachers.length) throw new Error("No teacher data in cron job");
-      let reminders: { teacherIndex: number; message: string }[] = [];
-      try {
-        const resp = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: `Buat pesan WhatsApp reminder untuk ${teachers.length} guru berikut.\nTopik: "${job.topic}".\n\nData guru:\n${teachers.map((t: any, i: number) => `Guru ${i+1}: Nama=${t.nama}, Mapel=${t.mapel}, Progress=${t.progressRata}%, Kekurangan=${t.kekurangan}`).join("\n")}\n\nAturan:\n1. Setiap guru mendapat pesan UNIK (variasi pembuka/penutup/struktur).\n2. Sebut progress rata-rata dan 2-3 bagian terendah.\n3. Bahasa formal hangat Indonesia.`,
-          config: {
-            systemInstruction: "Anda admin sekolah. Jawaban array JSON tanpa markdown.",
-            responseMimeType: "application/json",
-            responseSchema: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { teacherIndex: { type: Type.INTEGER }, message: { type: Type.STRING } }, required: ["teacherIndex", "message"] } }
-          }
-        });
-        reminders = JSON.parse(resp.text || "[]");
-      } catch (e: any) {
-        throw new Error(`Gemini error: ${e.message}`);
-      }
-      // Send via Fonnte
-      let sent = 0, failed = 0;
-      for (const r of reminders) {
-        const td = job.teacherData[r.teacherIndex];
-        if (!td || !td.telepon) { failed++; continue; }
-        try {
-          const params = new URLSearchParams({ target: td.telepon, message: r.message });
-          const resp = await fetch("https://api.fonnte.com/send", {
-            method: "POST",
-            headers: { "Authorization": job.fonnteToken, "Content-Type": "application/x-www-form-urlencoded" },
-            body: params.toString()
-          });
-          const data = await resp.json();
-          if (data.status === true || data.status === "true") sent++;
-          else failed++;
-        } catch { failed++; }
-      }
-      job.lastRunAt = new Date().toISOString();
-      job.lastStatus = "success";
-      job.lastMessage = `Terkirim: ${sent}, Gagal: ${failed}`;
-      console.log(`Cron ${job.name}: ${job.lastMessage}`);
-    } catch (e: any) {
-      job.lastStatus = "error";
-      job.lastMessage = e.message;
-      console.error(`Cron ${job.name} failed:`, e.message);
-    }
-    this.jobs[idx] = job;
-    await saveCronJobs(this.jobs);
+    if (idx >= 0) this.jobs[idx] = job;
   }
 }
 
@@ -174,9 +230,8 @@ const ai = new GoogleGenAI({
   },
 });
 
-async function startServer() {
+export function buildApp() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: "10mb" }));
 
@@ -952,7 +1007,7 @@ Aturan ekstraksi:
       const jobs = await loadCronJobs();
       jobs.push(record);
       await saveCronJobs(jobs);
-      cronScheduler.init(jobs);
+      if (!isServerless()) cronScheduler.init(jobs);
       res.json({ success: true, job: record });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
@@ -963,7 +1018,7 @@ Aturan ekstraksi:
       if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
       jobs[idx].enabled = !jobs[idx].enabled;
       await saveCronJobs(jobs);
-      cronScheduler.init(jobs);
+      if (!isServerless()) cronScheduler.init(jobs);
       res.json({ success: true, job: jobs[idx] });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
@@ -986,8 +1041,31 @@ Aturan ekstraksi:
       if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
       jobs.splice(idx, 1);
       await saveCronJobs(jobs);
-      cronScheduler.init(jobs);
+      if (!isServerless()) cronScheduler.init(jobs);
       res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+
+  // ─── CRON TICK (pemicu serverless / persistent) ───
+  // Dipanggil cron-job.org tiap menit. Menjalankan job yang jatuh tempo (bypass node-cron
+  // karena instance serverless tidak bisa menyimpan timer). Aman dipanggil berulang:
+  // job hanya berjalan satu kali per hari per jadwal (cek lastRunAt).
+  app.post("/api/cron-tick", async (req, res) => {
+    const tickToken = process.env.CRON_TICK_TOKEN;
+    if (tickToken && req.headers.authorization !== `Bearer ${tickToken}`) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+    try {
+      const jobs = await loadCronJobs();
+      const now = new Date();
+      let ran: string[] = [];
+      for (const job of jobs) {
+        if (isCronDue(job, now)) {
+          await executeCronJobRecord(job);
+          ran.push(job.id);
+        }
+      }
+      res.json({ success: true, checked: jobs.length, ran, tz: CRON_TZ, now: now.toISOString() });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
 
@@ -1040,27 +1118,36 @@ Aturan ekstraksi:
     }
   });
 
-  // Serve static UI assets / route handling in development or production
+  return app;
+}
+
+// Ekspor aplikasi untuk mode serverless (Vercel). Static assets ditangani Vercel sendiri,
+// jadi di sini hanya route API (buildApp tidak memuat Vite/static).
+export const app = buildApp();
+
+// Jalankan proses persistent (dev / VPS): tambahkan Vite HMR atau static dist + listen.
+async function startServer() {
+  const PORT = Number(process.env.PORT) || 3000;
+  const server = buildApp();
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
+    const { createServer } = await import("vite");
+    const vite = await createServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
-    app.use(vite.middlewares);
-  } else {
+    server.use(vite.middlewares);
+  } else if (fs.existsSync(path.join(process.cwd(), "dist"))) {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    server.use(express.static(distPath));
+    server.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server is running with Express and Vite at http://localhost:${PORT}`);
   });
-  // Init cron scheduler with persisted jobs
   const savedJobs = await loadCronJobs();
   cronScheduler.init(savedJobs);
 }
 
-startServer();
+if (isMainModule()) startServer();

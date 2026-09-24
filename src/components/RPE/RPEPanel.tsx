@@ -1,10 +1,10 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
 import { Plus, FileText, Clock, Copy, Save, History, BookTemplate, ChevronLeft, Eye, Pencil, Check, X, Calendar, BookOpen } from "lucide-react";
 import RPEForm from "./RPEForm";
 import {
   RPERecord, RPEHistoryEntry, loadRPEList, saveRPEList,
   loadRPEHistory, pushRPEHistory, loadTemplate, saveTemplate,
-  createEmptyRPE, calculateTotals
+  createEmptyRPE, calculateTotals, pullRPEFromCloud
 } from "./RPEUtils";
 
 interface Props {
@@ -20,6 +20,18 @@ export default function RPEPanel({ config, onUpdateConfig }: Props) {
   const [historyRpeId, setHistoryRpeId] = useState<string>("");
   const [templateType, setTemplateType] = useState<"gasal" | "genap">("gasal");
   const [templateData, setTemplateData] = useState<RPERecord | null>(null);
+
+  // Tarik data dari cloud (lintas perangkat) saat panel dibuka.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      await pullRPEFromCloud();
+      if (!alive) return;
+      setRpeList(loadRPEList());
+      setTemplateData(loadTemplate(templateType));
+    })();
+    return () => { alive = false; };
+  }, []);
 
   const guruOptions = useMemo(() => {
     return (config?.gurus || []).map((g: any) => ({ id: g.id, nama: g.nama }));

@@ -15,6 +15,7 @@ import HTMLtoDOCX from "html-to-docx";
 import cron from "node-cron";
 import multer from "multer";
 import pdfParse from "pdf-parse";
+import { dbGet, dbPut, dbList, isUsingSupabase } from "./db";
 
 // Pre-calculated TWIP (twentieths of a point) values for page margins
 // 1cm ≈ 567 TWIP, 2.54cm = 1 inch = 1440 TWIP
@@ -51,18 +52,29 @@ interface CronJobRecord {
   teacherData: StoredTeacherData[];
 }
 const CRON_JOBS_FILE = path.join(process.cwd(), "cron_jobs.json");
-function loadCronJobs(): CronJobRecord[] {
+const CRON_JOBS_KEY = "cron_jobs";
+async function loadCronJobs(): Promise<CronJobRecord[]> {
+  try {
+    const fromDb = await dbGet<CronJobRecord[]>(CRON_JOBS_KEY);
+    if (Array.isArray(fromDb)) return fromDb;
+  } catch (e) { console.error("Error loading cron jobs from DB:", e); }
   try { if (fs.existsSync(CRON_JOBS_FILE)) return JSON.parse(fs.readFileSync(CRON_JOBS_FILE, "utf-8")); }
   catch (e) { console.error("Error loading cron jobs:", e); }
   return [];
 }
-function saveCronJobs(jobs: CronJobRecord[]) {
-  fs.writeFileSync(CRON_JOBS_FILE, JSON.stringify(jobs, null, 2));
+async function saveCronJobs(jobs: CronJobRecord[]) {
+  try {
+    if (isUsingSupabase()) {
+      await dbPut(CRON_JOBS_KEY, jobs);
+      return;
+    }
+    fs.writeFileSync(CRON_JOBS_FILE, JSON.stringify(jobs, null, 2));
+  } catch (e) { console.error("Error saving cron jobs:", e); }
 }
 
 // ─── CRON SCHEDULER ───
 class CronScheduler {
-  private tasks = new Map<string, cron.ScheduledTask>();
+  private tasks = new Map<string, ReturnType<typeof cron.schedule>>();
   private jobs: CronJobRecord[] = [];
 
   init(jobs: CronJobRecord[]) {
@@ -96,7 +108,7 @@ class CronScheduler {
     const job = this.jobs[idx];
     console.log(`Cron executing: ${job.name} (${job.id})`);
     job.lastStatus = null;
-    saveCronJobs(this.jobs);
+    await saveCronJobs(this.jobs);
     try {
       // Generate AI messages using stored teacher data
       const teachers = job.teacherData.map(t => ({
@@ -146,7 +158,7 @@ class CronScheduler {
       console.error(`Cron ${job.name} failed:`, e.message);
     }
     this.jobs[idx] = job;
-    saveCronJobs(this.jobs);
+    await saveCronJobs(this.jobs);
   }
 }
 
@@ -164,9 +176,21 @@ const ai = new GoogleGenAI({
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: "10mb" }));
+
+  // ─── CORS (frontend di domain berbeda, mis. Vercel → backend Render) ───
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const allowed = process.env.CORS_ORIGIN || "";
+    res.setHeader("Access-Control-Allow-Origin", allowed ? allowed : (origin || "*"));
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
 
   // API Route: AI Generasi Modul Ajar (Deep Learning)
   app.post("/api/gemini/generate-modul", async (req, res) => {
@@ -906,10 +930,10 @@ Aturan ekstraksi:
   });
 
   // ─── CRON JOB ENDPOINTS ───
-  app.get("/api/cron/list", (_req, res) => {
-    res.json({ success: true, jobs: loadCronJobs() });
+  app.get("/api/cron/list", async (_req, res) => {
+    res.json({ success: true, jobs: await loadCronJobs() });
   });
-  app.post("/api/cron/create", (req, res) => {
+  app.post("/api/cron/create", async (req, res) => {
     try {
       const { name, topic, teacherIds, daysOfWeek, time, fonnteToken, teacherData } = req.body;
       if (!name || !topic || !time || !daysOfWeek?.length) {
@@ -925,46 +949,95 @@ Aturan ekstraksi:
         fonnteToken: fonnteToken || "",
         teacherData: teacherData || []
       };
-      const jobs = loadCronJobs();
+      const jobs = await loadCronJobs();
       jobs.push(record);
-      saveCronJobs(jobs);
+      await saveCronJobs(jobs);
       cronScheduler.init(jobs);
       res.json({ success: true, job: record });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
-  app.post("/api/cron/:id/toggle", (req, res) => {
+  app.post("/api/cron/:id/toggle", async (req, res) => {
     try {
-      const jobs = loadCronJobs();
+      const jobs = await loadCronJobs();
       const idx = jobs.findIndex(j => j.id === req.params.id);
       if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
       jobs[idx].enabled = !jobs[idx].enabled;
-      saveCronJobs(jobs);
+      await saveCronJobs(jobs);
       cronScheduler.init(jobs);
       res.json({ success: true, job: jobs[idx] });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
-  app.post("/api/cron/:id/sync", (req, res) => {
+  app.post("/api/cron/:id/sync", async (req, res) => {
     try {
       const { teacherData, fonnteToken } = req.body;
-      const jobs = loadCronJobs();
+      const jobs = await loadCronJobs();
       const idx = jobs.findIndex(j => j.id === req.params.id);
       if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
       if (teacherData) jobs[idx].teacherData = teacherData;
       if (fonnteToken) jobs[idx].fonnteToken = fonnteToken;
-      saveCronJobs(jobs);
+      await saveCronJobs(jobs);
       res.json({ success: true, job: jobs[idx] });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
   });
-  app.delete("/api/cron/:id", (req, res) => {
+  app.delete("/api/cron/:id", async (req, res) => {
     try {
-      let jobs = loadCronJobs();
+      let jobs = await loadCronJobs();
       const idx = jobs.findIndex(j => j.id === req.params.id);
       if (idx === -1) return res.status(404).json({ success: false, error: "Cron job not found" });
       jobs.splice(idx, 1);
-      saveCronJobs(jobs);
+      await saveCronJobs(jobs);
       cronScheduler.init(jobs);
       res.json({ success: true });
     } catch (e: any) { res.status(500).json({ success: false, error: e.message }); }
+  });
+
+  // ─── DATA SYNC ENDPOINTS (Supabase KV) ───
+  app.get("/api/health", (_req, res) => {
+    res.json({ success: true, time: new Date().toISOString(), usingSupabase: isUsingSupabase() });
+  });
+
+  app.get("/api/data/list", async (req, res) => {
+    try {
+      const prefix = String(req.query.prefix || "");
+      const items = await dbList(prefix);
+      res.json({ success: true, items });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  app.get("/api/data/:key", async (req, res) => {
+    try {
+      const value = await dbGet(req.params.key);
+      if (value === null || value === undefined) {
+        return res.status(404).json({ success: false, error: "not_found" });
+      }
+      res.json({ success: true, value });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  app.put("/api/data/:key", async (req, res) => {
+    try {
+      const value = req.body;
+      if (value === undefined) {
+        return res.status(400).json({ success: false, error: "Request body diperlukan" });
+      }
+      await dbPut(req.params.key, value);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  app.post("/api/data/:key/delete", async (req, res) => {
+    try {
+      // Delete tidak dipakai saat ini; placeholder agar jelas key `delete` tidak bentrok.
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e.message });
+    }
   });
 
   // Serve static UI assets / route handling in development or production
@@ -986,7 +1059,8 @@ Aturan ekstraksi:
     console.log(`Server is running with Express and Vite at http://localhost:${PORT}`);
   });
   // Init cron scheduler with persisted jobs
-  cronScheduler.init(loadCronJobs());
+  const savedJobs = await loadCronJobs();
+  cronScheduler.init(savedJobs);
 }
 
 startServer();

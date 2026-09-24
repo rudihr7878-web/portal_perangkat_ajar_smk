@@ -9,6 +9,7 @@ import {
 } from "./utils";
 import { AdministrasiTahunState } from "./types";
 import { generateExportHtml, generateExportHtmlForTab, TAB_FILENAMES } from "./exportHtml";
+import { cloudGet, apiFetch, CLOUD_KEYS } from "./api";
 
 import HalamanCover from "./components/HalamanCover";
 import KalenderAkademikView from "./components/KalenderAkademikView";
@@ -136,16 +137,44 @@ export default function App() {
   const [isSavedNotify, setIsSavedNotify] = useState(false);
   const [confirmAction, setConfirmAction] = useState<{ title: string; message: string; onConfirm: () => void } | null>(null);
 
+  // Hydrasi config admin dari cloud (data pusat) saat aplikasi dimuat.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const cloud = await cloudGet<AdminMasterConfig>(CLOUD_KEYS.adminMaster);
+      if (!alive || !cloud) return;
+      setAdminConfig((prev) => ({ ...prev, ...cloud }));
+    })();
+    return () => { alive = false; };
+  }, []);
+
   useEffect(() => {
     if (currentUser?.role === "guru" && currentUser?.teacherId) {
       const activeProfile = adminConfig.gurus.find((g) => g.id === currentUser.teacherId) || adminConfig.gurus[0];
-      const portfolio = loadTeacherPortfolio(currentUser.teacherId, activeProfile);
-      setState(portfolio);
+      let alive = true;
       setActiveTab("dashboard");
+      (async () => {
+        // Muat cache lokal dulu (responsif), lalu ambil versi cloud (otoritatif).
+        const local = loadTeacherPortfolio(currentUser.teacherId!, activeProfile);
+        if (alive) setState(local);
+        const cloud = await cloudGet<AdministrasiTahunState>(
+          `${CLOUD_KEYS.portfolioPrefix}${currentUser.teacherId}`
+        );
+        if (alive && cloud) {
+          const merged: AdministrasiTahunState = {
+            ...INITIAL_STATE,
+            ...cloud,
+            identitas: { ...INITIAL_STATE.identitas, ...activeProfile, ...cloud.identitas },
+          };
+          if (!Array.isArray(merged.modul)) merged.modul = [merged.modul];
+          setState(merged);
+        }
+      })();
+      return () => { alive = false; };
     } else {
       setState(null);
     }
-  }, [currentUser, adminConfig]);
+  }, [currentUser]);
 
   useEffect(() => {
     if (state && currentUser?.role === "guru" && currentUser?.teacherId) {
@@ -229,7 +258,7 @@ export default function App() {
     const m = String(now.getMonth() + 1).padStart(2, "0");
     const d = String(now.getDate()).padStart(2, "0");
     try {
-      const res = await fetch("/api/export-docx", {
+      const res = await apiFetch("/api/export-docx", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ html, orientation: "portrait" })
@@ -263,7 +292,7 @@ export default function App() {
     const d = String(now.getDate()).padStart(2, "0");
     const filename = TAB_FILENAMES[tabId] || tabId;
     try {
-      const res = await fetch("/api/export-docx", {
+      const res = await apiFetch("/api/export-docx", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ html, orientation: tabId === "kurikulum" || tabId === "jurnal" ? "landscape" : "portrait" })

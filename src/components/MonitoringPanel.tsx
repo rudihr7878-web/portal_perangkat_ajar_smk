@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { AdminMasterConfig, loadTeacherPortfolio } from "../utils";
 import { AdministrasiTahunState } from "../types";
+import { cloudList, apiFetch, CLOUD_KEYS } from "../api";
 import {
   Activity,
   TrendingUp,
@@ -162,10 +163,21 @@ export default function MonitoringPanel({ config }: Props) {
   const [progressList, setProgressList] = useState<TeacherProgress[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
 
-  // Load all teacher portfolios
+  // Load all teacher portfolios (cloud dulu, fallback localStorage)
   useEffect(() => {
-    const list: TeacherProgress[] = config.gurus.map((g) => {
-      const portfolio = loadTeacherPortfolio(g.id, g);
+    let alive = true;
+    (async () => {
+      const cloudPortfolios: Record<string, AdministrasiTahunState> = {};
+      try {
+        const items = await cloudList<AdministrasiTahunState>(CLOUD_KEYS.portfolioPrefix);
+        for (const it of items) {
+          const id = it.key.slice(CLOUD_KEYS.portfolioPrefix.length);
+          cloudPortfolios[id] = it.value;
+        }
+      } catch { /* abaikan, gunakan fallback lokal */ }
+      if (!alive) return;
+      const list: TeacherProgress[] = config.gurus.map((g) => {
+      const portfolio = cloudPortfolios[g.id] || loadTeacherPortfolio(g.id, g);
       const cover = calcCover(portfolio);
       const kalender = calcKalender(portfolio);
       const kurikulum = calcKurikulum(portfolio);
@@ -178,7 +190,9 @@ export default function MonitoringPanel({ config }: Props) {
       const avg = Math.round((cover + kalender + kurikulum + modul + jurnal + presensi + analisis + walikelas + refleksi) / 9);
       return { id: g.id, nama: g.namaGuru, mapel: g.mapel, cover, kalender, kurikulum, modul, jurnal, presensi, analisis, walikelas, refleksi, avg };
     });
-    setProgressList(list);
+      setProgressList(list);
+    })();
+    return () => { alive = false; };
   }, [config]);
 
   const filteredProgress = progressList.filter(
@@ -214,7 +228,7 @@ export default function MonitoringPanel({ config }: Props) {
   // Load cron jobs
   const loadCronJobs = async () => {
     try {
-      const res = await fetch("/api/cron/list");
+      const res = await apiFetch("/api/cron/list");
       const data = await res.json();
       if (data.success) setCronJobs(data.jobs);
     } catch { /* ignore */ }
@@ -236,7 +250,7 @@ export default function MonitoringPanel({ config }: Props) {
     }));
     const ids = cronAllTeachers ? [] : cronSelectedIds;
     try {
-      const res = await fetch("/api/cron/create", {
+      const res = await apiFetch("/api/cron/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -262,7 +276,7 @@ export default function MonitoringPanel({ config }: Props) {
 
   const handleToggleCron = async (id: string) => {
     try {
-      const res = await fetch(`/api/cron/${id}/toggle`, { method: "POST" });
+      const res = await apiFetch(`/api/cron/${id}/toggle`, { method: "POST" });
       const data = await res.json();
       if (data.success) loadCronJobs();
     } catch { /* ignore */ }
@@ -270,7 +284,7 @@ export default function MonitoringPanel({ config }: Props) {
 
   const handleDeleteCron = async (id: string) => {
     try {
-      const res = await fetch(`/api/cron/${id}`, { method: "DELETE" });
+      const res = await apiFetch(`/api/cron/${id}`, { method: "DELETE" });
       const data = await res.json();
       if (data.success) loadCronJobs();
     } catch { /* ignore */ }
@@ -282,7 +296,7 @@ export default function MonitoringPanel({ config }: Props) {
       progressRata: p.avg, kekurangan: getKekurangan(p)
     }));
     try {
-      const res = await fetch(`/api/cron/${id}/sync`, {
+      const res = await apiFetch(`/api/cron/${id}/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ teacherData, fonnteToken: config.fonnteToken })
@@ -356,7 +370,7 @@ export default function MonitoringPanel({ config }: Props) {
         const p = progressList.find((x) => x.id === id);
         return p ? { nama: p.nama, mapel: p.mapel, progressRata: p.avg, kekurangan: getKekurangan(p) } : null;
       }).filter(Boolean);
-      const res = await fetch("/api/gemini/generate-reminder", {
+      const res = await apiFetch("/api/gemini/generate-reminder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic, teachers })
@@ -418,7 +432,7 @@ export default function MonitoringPanel({ config }: Props) {
       const phone = config.gurus.find((g) => g.id === id)?.teleponGuru;
       if (!phone) { failed++; continue; }
       try {
-        const res = await fetch("/api/send-wa", {
+        const res = await apiFetch("/api/send-wa", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: config.fonnteToken, targets: [phone], message: msg })
@@ -492,7 +506,7 @@ export default function MonitoringPanel({ config }: Props) {
       <thead><tr style="background:#ddd"><th style="padding:4px 6px;border:1px solid #000;font-size:10pt">Nama Guru</th><th style="padding:4px 6px;border:1px solid #000;font-size:10pt">Rata</th><th style="padding:4px 6px;border:1px solid #000;font-size:10pt">Cover</th><th style="padding:4px 6px;border:1px solid #000;font-size:10pt">Kalender</th><th style="padding:4px 6px;border:1px solid #000;font-size:10pt">Walikelas</th></tr></thead>
       <tbody>${rows}</tbody></table>`;
     try {
-      const res = await fetch("/api/export-docx", {
+      const res = await apiFetch("/api/export-docx", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ html, orientation: "landscape" })

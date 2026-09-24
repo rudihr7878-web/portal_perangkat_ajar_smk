@@ -180,10 +180,10 @@ ${logoHtml}
       modulHtml = "<p style='text-align:center;padding:24pt;font-style:italic;'>Tidak ada data modul ajar.</p>";
     } else {
       modulHtml = modul.map((m, idx) => {
-        const kem = m.kegiatanPembelajaran || { pendahuluan: [], intiDeepLearning: {}, penutup: [] };
-        const idl = kem.intiDeepLearning || {};
-        const akses = m.aksesmen || {};
-        const dife = m.diferensiasi || {};
+        const kem = m.kegiatanPembelajaran || { pendahuluan: [] as string[], intiDeepLearning: { mindfulEngagement: [] as string[], deepProcessing: [] as string[], transferOfLearning: [] as string[] }, penutup: [] as string[] };
+        const idl = kem.intiDeepLearning;
+        const akses = m.aksesmen || { diagnostik: "", formatif: "", sumatif: "" };
+        const dife = m.diferensiasi || { konten: "", proses: "", produk: "" };
         const pp = m.profilPancasila;
         const ppHtml = pp && pp.length ? `<p>Profil Pancasila: ${pp.join("; ")}</p>` : "";
         return `<div>

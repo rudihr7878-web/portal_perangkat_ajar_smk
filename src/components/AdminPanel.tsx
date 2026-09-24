@@ -7,6 +7,7 @@ import React, { useState, useRef } from "react";
 import { AdminMasterConfig } from "../utils";
 import { Siswa } from "../types";
 import * as XLSX from "xlsx";
+import { apiFetch } from "../api";
 import OfficialKaldikView from "./OfficialKaldikView";
 import {
   Users,
@@ -401,7 +402,7 @@ export default function AdminPanel({ config, onUpdateConfig }: Props) {
     formData.append("file", file);
 
     try {
-      const res = await fetch("/api/gemini/parse-pdf", { method: "POST", body: formData });
+      const res = await apiFetch("/api/gemini/parse-pdf", { method: "POST", body: formData });
       const data = await res.json();
       if (data.success && Array.isArray(data.agenda)) {
         const allSelected = new Set(data.agenda.map((_: any, i: number) => i));

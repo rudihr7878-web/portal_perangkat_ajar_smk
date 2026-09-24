@@ -5,6 +5,7 @@
 
 import React, { useState } from "react";
 import { ModulAjar, AdministrasiTahunState } from "../types";
+import { apiFetch } from "../api";
 import { BookOpen, Sparkles, Wand2, ShieldAlert, Check, HelpCircle, ArrowRight, Save } from "lucide-react";
 
 interface Props {
@@ -148,7 +149,7 @@ export default function ModulAjarView({ state, onChange }: Props) {
     setIsKoreksiLoading(true);
     setKoreksiResult(null);
     try {
-      const res = await fetch("/api/gemini/koreksi-modul", {
+      const res = await apiFetch("/api/gemini/koreksi-modul", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -176,7 +177,7 @@ export default function ModulAjarView({ state, onChange }: Props) {
     if (!modul) return;
     setIsGeneratingExp(expId);
     try {
-      const res = await fetch("/api/gemini/generate-aktivitas", {
+      const res = await apiFetch("/api/gemini/generate-aktivitas", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ experience: expId, temaModul: modul.temaModul, mapel: identitas.mapel }),
@@ -240,7 +241,7 @@ export default function ModulAjarView({ state, onChange }: Props) {
     if (!modul) return;
     setIsRubrikLoading(true);
     try {
-      const res = await fetch("/api/gemini/generate-rubrik", {
+      const res = await apiFetch("/api/gemini/generate-rubrik", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ modul, mapel: identitas.mapel }),
@@ -274,7 +275,7 @@ export default function ModulAjarView({ state, onChange }: Props) {
     if (!modul) return;
     setIsReviewLoading(true);
     try {
-      const res = await fetch("/api/gemini/review-modul", {
+      const res = await apiFetch("/api/gemini/review-modul", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ modul, mapel: identitas.mapel }),
@@ -1120,16 +1121,19 @@ export default function ModulAjarView({ state, onChange }: Props) {
               <div className="space-y-4 p-5 bg-amber-50/50 rounded-2xl border border-amber-100">
                 <h4 className="text-xs font-bold text-amber-900 uppercase tracking-wider">Hasil Review AI</h4>
                 <div className="space-y-2">
-                  {Object.entries(reviewResult.scores).map(([key, val]) => (
+                  {Object.entries(reviewResult.scores).map(([key, val]) => {
+                    const v = typeof val === "number" ? val : Number(val) || 0;
+                    return (
                     <div key={key} className="flex items-center gap-2 text-xs">
                       <span className="w-24 font-bold text-warm-text capitalize">{key}</span>
                       <div className="flex-1 h-2 bg-warm-bg rounded-full overflow-hidden">
-                        <div className={`h-full rounded-full ${val >= 80 ? "bg-emerald-500" : val >= 50 ? "bg-amber-500" : "bg-red-400"}`}
-                          style={{ width: `${Math.min(100, val)}%` }} />
+                        <div className={`h-full rounded-full ${v >= 80 ? "bg-emerald-500" : v >= 50 ? "bg-amber-500" : "bg-red-400"}`}
+                          style={{ width: `${Math.min(100, v)}%` }} />
                       </div>
-                      <span className="font-bold w-6 text-right">{val}</span>
+                      <span className="font-bold w-6 text-right">{v}</span>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
                 <div className="text-center">
                   <span className="text-3xl font-extrabold text-amber-800">{reviewResult.total}</span>

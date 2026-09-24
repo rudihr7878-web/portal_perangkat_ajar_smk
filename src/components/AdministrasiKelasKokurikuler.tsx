@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { ProyekKokurikuler, PortofolioItem, AdministrasiTahunState } from "../types";
 import { DIMENSI_PROFIL_LULUSAN } from "../utils";
+import { apiFetch } from "../api";
 import { School, Layers, Image, Plus, Trash2, Award, ClipboardCheck, Users, HelpCircle, Sparkles, Printer } from "lucide-react";
 
 interface Props {
@@ -12,7 +13,14 @@ function generateId(prefix: string): string {
   return prefix + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
 }
 
-function ProyekCard({ proyek, onRemove, onCetak }: { proyek: ProyekKokurikuler; onRemove: (id: string) => void; onCetak: (p: ProyekKokurikuler) => void }) {
+interface ProyekCardProps {
+  key?: string | number;
+  proyek: ProyekKokurikuler;
+  onRemove: (id: string) => void;
+  onCetak: (p: ProyekKokurikuler) => void;
+}
+
+function ProyekCard({ proyek, onRemove, onCetak }: ProyekCardProps) {
   return (
     <div key={proyek.id} className="border border-warm-border rounded-3xl p-6 bg-warm-bg/20 relative space-y-4">
       <button onClick={() => onRemove(proyek.id)} aria-label="Hapus Proyek" className="absolute top-6 right-6 text-warm-muted hover:text-red-500 transition-colors print:hidden focus-visible:outline-2 focus-visible:outline-amber-accent cursor-pointer"><Trash2 className="h-4 w-4" aria-hidden="true" /></button>
@@ -99,7 +107,7 @@ export default function AdministrasiKelasKokurikuler({ state, onChange }: Props)
     setAiLoading(true);
     setAiError("");
     try {
-      const res = await fetch("/api/gemini/generate-kokurikuler", {
+      const res = await apiFetch("/api/gemini/generate-kokurikuler", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tema: aiTema, jenjang: aiJenjang, jurusan: aiJurusan, jumlahMinggu: aiJumlahMinggu })

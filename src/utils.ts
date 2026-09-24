@@ -4,6 +4,7 @@
  */
 
 import { AdministrasiTahunState, Siswa } from "./types";
+import { cloudPut } from "./api";
 
 export const DIMENSI_PROFIL_LULUSAN = [
   "Keimanan dan Ketakwaan",
@@ -531,6 +532,10 @@ export function saveAdminMasterConfig(config: AdminMasterConfig) {
   } catch (e) {
     console.error("Error writing admin config:", e);
   }
+  // mirror ke cloud agar terbaca dari perangkat lain
+  cloudPut("sim_guru_admin_master", config).then((ok) => {
+    if (!ok) console.warn("Cloud sync admin config gagal");
+  });
 }
 
 export function loadTeacherPortfolio(teacherId: string, profile: any): AdministrasiTahunState {
@@ -563,6 +568,9 @@ export function saveTeacherPortfolio(teacherId: string, state: AdministrasiTahun
   try {
     const key = `sim_guru_portfolio_${teacherId}`;
     localStorage.setItem(key, JSON.stringify(state));
+    cloudPut(key, state).then((ok) => {
+      if (!ok) console.warn(`Cloud sync portofolio ${teacherId} gagal`);
+    });
   } catch (e) {
     console.error("Error writing teacher portfolio:", e);
   }

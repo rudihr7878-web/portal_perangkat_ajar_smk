@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
+import { cloudGet, cloudPut, CLOUD_KEYS } from "../../api";
 
 export interface RPEDetailBulan {
   bulan: string;
@@ -60,6 +61,31 @@ function getItem<T>(key: string, fallback: T): T {
 
 function setItem(key: string, value: any) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  cloudPut(key, value).then((ok) => {
+    if (!ok) console.warn("Cloud sync RPE gagal:", key);
+  });
+}
+
+/** Tarik semua data RPE dari cloud ke cache lokal (dipanggil saat panel dibuka). */
+export async function pullRPEFromCloud() {
+  try {
+    const list = await cloudGet<RPERecord[]>(CLOUD_KEYS.rpeList);
+    if (Array.isArray(list)) {
+      try { localStorage.setItem(STORAGE_LIST_KEY, JSON.stringify(list)); } catch {}
+      for (const r of list) {
+        const h = await cloudGet<RPEHistoryEntry[]>(CLOUD_KEYS.rpeHistoryPrefix + r.id);
+        if (Array.isArray(h)) {
+          try { localStorage.setItem(STORAGE_HISTORY_PREFIX + r.id, JSON.stringify(h)); } catch {}
+        }
+      }
+    }
+    const gasal = await cloudGet<RPERecord | null>(CLOUD_KEYS.rpeTemplateGasal);
+    if (gasal) { try { localStorage.setItem(STORAGE_TEMPLATE_GASAL, JSON.stringify(gasal)); } catch {} }
+    const genap = await cloudGet<RPERecord | null>(CLOUD_KEYS.rpeTemplateGenap);
+    if (genap) { try { localStorage.setItem(STORAGE_TEMPLATE_GENAP, JSON.stringify(genap)); } catch {} }
+  } catch (e) {
+    console.warn("pullRPEFromCloud error:", e);
+  }
 }
 
 export function loadRPEList(): RPERecord[] {

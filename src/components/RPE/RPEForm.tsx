@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useCallback } from "react";
 import { Plus, Trash2, Wand2, Download, Printer, Upload, FileSpreadsheet, AlertTriangle, Lightbulb, ChevronDown, ChevronUp } from "lucide-react";
 import { RPERecord, RPEDetailBulan, RPEKegiatan, calculateTotals, useAutoSave, exportRPEToExcel, exportRPEToPrint, importRPEFromExcel } from "./RPEUtils";
+import { apiFetch } from "../../api";
 
 interface Props {
   rpe: RPERecord;
@@ -56,7 +57,7 @@ export default function RPEForm({ rpe, onChange, onSave, guruOptions }: Props) {
     setAILoading(true);
     setShowAI(true);
     try {
-      const res = await fetch("/api/gemini/generate-rpe-recommendation", {
+      const res = await apiFetch("/api/gemini/generate-rpe-recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
